@@ -1,0 +1,33 @@
+{
+  "name": "rss-to-email-worker",
+  "version": "1.0.0",
+  "description": "Email new RSS feed items to double-opt-in subscribers, on Cloudflare Workers + D1 + Mailgun.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "db:migrate": "wrangler d1 migrations apply DB --remote"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PinePeakDigital/rss-to-email-worker.git"
+  },
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/PinePeakDigital/rss-to-email-worker/issues"
+  },
+  "homepage": "https://github.com/PinePeakDigital/rss-to-email-worker#readme",
+  "dependencies": {
+    "fast-xml-parser": "^5.11.1"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "@cloudflare/workers-types": "^5.20260918.1",
+    "typescript": "^7.0.2",
+    "vitest": "~4.1.0",
+    "wrangler": "^4.135.0"
+  },
+  "private": true,
+  "type": "module"
+}

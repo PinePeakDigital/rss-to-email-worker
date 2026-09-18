@@ -1,0 +1,30 @@
+// Placeholder values: edit them here, or copy this file to a gitignored wrangler.<name>.jsonc
+// and pass `-c wrangler.<name>.jsonc` to wrangler commands.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "rss-to-email",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-15",
+  "triggers": { "crons": ["0 * * * *"] },
+  "routes": [{ "pattern": "mail.example.com", "custom_domain": true }],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      // No database_id: `wrangler deploy` provisions the database, and later deploys find it without one.
+      "database_name": "rss-to-email",
+      "migrations_dir": "migrations"
+    }
+  ],
+  // Secrets (`npx wrangler secret put`): MAILGUN_API_KEY, TURNSTILE_SECRET.
+  "vars": {
+    "FEED_URL": "https://example.com/rss.xml",
+    "PUBLIC_URL": "https://mail.example.com",
+    "SITE_NAME": "Example Newsletter",
+    "SITE_URL": "https://example.com",
+    "FROM": "Example Newsletter <newsletter@mail.example.com>",
+    "ADMIN_EMAIL": "you@example.com",
+    "MAILGUN_DOMAIN": "mail.example.com",
+    // EU-region Mailgun accounts: https://api.eu.mailgun.net
+    "MAILGUN_API_BASE": "https://api.mailgun.net"
+  }
+}
