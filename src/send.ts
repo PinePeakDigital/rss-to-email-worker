@@ -60,7 +60,7 @@ export async function tick(env: Env, now = Date.now()): Promise<void> {
   const errors: unknown[] = [];
   const attempt = (what: string, fn: () => Promise<void>) =>
     fn().catch((e) => {
-      console.error(`${what} failed; continuing`, e);
+      console.error("tick phase failed; continuing:", what, e); // what may hold a feed guid: keep it out of the format string
       errors.push(e);
     });
 
