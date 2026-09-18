@@ -31,11 +31,13 @@ You need a Cloudflare account, a Mailgun account with a verified sending domain 
 ```html
 <form method="post" action="https://mail.example.com/subscribe">
   <input type="email" name="email" required placeholder="you@example.com">
-  <div class="cf-turnstile" data-sitekey="YOUR_SITE_KEY"></div>
+  <div class="cf-turnstile" data-sitekey="YOUR_SITE_KEY" data-action="subscribe"></div>
   <button>Subscribe</button>
 </form>
 <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
 ```
+
+The Worker accepts a token only if its action is `subscribe` and its hostname is `SITE_URL`'s host with or without `www.`. Allow those hostnames on the Turnstile widget.
 
 ### Importing from Substack
 
