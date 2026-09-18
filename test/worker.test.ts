@@ -1,7 +1,7 @@
 import { env } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index";
-import { FLAG_AFTER_MS, STALE_MS, tick } from "../src/send";
+import { FLAG_AFTER_MS, parseFeed, STALE_MS, tick } from "../src/send";
 
 const NOW = Date.parse("2026-09-18T12:00:00Z");
 const DAY = 24 * 60 * 60 * 1000;
@@ -16,7 +16,7 @@ function feed(items: { guid: string; date: number }[]): string {
     .join("")}</channel></rss>`;
 }
 
-let feedXml: string;
+let feedXml: string | null; // null: the feed host is down
 let calls: FormData[];
 let mailgunReply: (form: FormData, n: number) => Response | Promise<Response>;
 
@@ -50,7 +50,7 @@ beforeEach(async () => {
   await env.DB.batch(["batches", "items", "subscribers"].map((t) => env.DB.prepare(`DELETE FROM ${t}`)));
   vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const url = input instanceof Request ? input.url : String(input);
-    if (url === env.FEED_URL) return new Response(feedXml);
+    if (url === env.FEED_URL) return feedXml === null ? new Response("down", { status: 503 }) : new Response(feedXml);
     if (url.endsWith("/messages")) {
       const form = init!.body as FormData;
       calls.push(form);
@@ -176,12 +176,89 @@ describe("tick", () => {
     expect(recipients()).not.toContain("later1@x.test");
   });
 
+  it("sends an item dated exactly at the stale cutoff, but not one a millisecond older", async () => {
+    await addSubscribers(1, "a");
+    feedXml = feed([{ guid: "old", date: NOW - 30 * DAY }]);
+    await tick(env, NOW);
+    feedXml = feed([
+      { guid: "old", date: NOW - 30 * DAY },
+      { guid: "edge", date: NOW - STALE_MS },
+      { guid: "past", date: NOW - STALE_MS - 1000 },
+    ]);
+    await tick(env, NOW);
+    expect(issueCalls().map((f) => f.get("subject"))).toEqual(["Post edge"]);
+  });
+
+  it("retries a refused batch once even when ticks overlap", async () => {
+    await addSubscribers(2500, "a");
+    await publishNewPost();
+    mailgunReply = (_f, n) => (n === 2 ? new Response("boom", { status: 500 }) : Response.json({}));
+    await tick(env, NOW);
+    await Promise.all([tick(env, NOW + 3600_000), tick(env, NOW + 3600_000)]);
+    expect(issueCalls()).toHaveLength(4);
+  });
+
+  it("marks a retried batch sent without calling Mailgun when everyone in it has left", async () => {
+    await addSubscribers(3, "a");
+    await publishNewPost();
+    mailgunReply = () => new Response("boom", { status: 500 });
+    await tick(env, NOW);
+    await env.DB.prepare("UPDATE subscribers SET status = 'unsubscribed'").run();
+    mailgunReply = () => Response.json({});
+    await tick(env, NOW + 3600_000);
+    expect(issueCalls()).toHaveLength(1);
+    expect(await env.DB.prepare("SELECT status FROM batches").first("status")).toBe("sent");
+  });
+
+  it("retries the admin alert until it sends, then stops", async () => {
+    await addSubscribers(1, "a");
+    await publishNewPost();
+    mailgunReply = () => {
+      throw new Error("connection reset");
+    };
+    await tick(env, NOW);
+    mailgunReply = (f) => (f.get("to") === env.ADMIN_EMAIL && alertCalls().length === 1 ? new Response("no", { status: 500 }) : Response.json({}));
+    await tick(env, NOW + FLAG_AFTER_MS + 1); // alert refused
+    await tick(env, NOW + 2 * FLAG_AFTER_MS); // alert sent
+    await tick(env, NOW + 3 * FLAG_AFTER_MS);
+    expect(alertCalls()).toHaveLength(2);
+  });
+
+  it("keeps sending open issues while the feed is down, and still reports the failure", async () => {
+    await addSubscribers(1, "a");
+    await publishNewPost();
+    mailgunReply = () => new Response("boom", { status: 500 });
+    await tick(env, NOW);
+    feedXml = null;
+    mailgunReply = () => Response.json({});
+    await expect(tick(env, NOW + 3600_000)).rejects.toThrow(AggregateError);
+    expect(issueCalls()).toHaveLength(2);
+  });
+
   it("sends each recipient once when ticks overlap", async () => {
     await addSubscribers(2500, "a");
     await publishNewPost();
     await Promise.all([tick(env, NOW), tick(env, NOW), tick(env, NOW)]);
     expect(recipients()).toHaveLength(2500);
     expect(new Set(recipients()).size).toBe(2500);
+  });
+});
+
+describe("parseFeed", () => {
+  const rss = (item: string) => `<rss version="2.0"><channel><title>t</title><item>${item}</item></channel></rss>`;
+
+  it("reads a guid with attributes, and treats a single item as a list", () => {
+    const [item] = parseFeed(rss('<guid isPermaLink="false">abc</guid><title>2026</title><pubDate>Fri, 18 Sep 2026 12:00:00 GMT</pubDate>'));
+    expect(item.guid).toBe("abc");
+    expect(item.title).toBe("2026"); // stays a string, not a number
+    expect(item.pubDate).toBe(NOW);
+  });
+
+  it("falls back to link for guid and description for body; missing pubDate is NaN", () => {
+    const [item] = parseFeed(rss("<link>https://x.test/a</link><description>&lt;p&gt;hi&lt;/p&gt;</description>"));
+    expect(item.guid).toBe("https://x.test/a");
+    expect(item.html).toBe("<p>hi</p>");
+    expect(item.pubDate).toBeNaN();
   });
 });
 
@@ -215,6 +292,16 @@ describe("subscription pages", () => {
     await post("/subscribe", form);
     expect((await status("reader@example.com")).status).toBe("pending");
     expect(calls).toHaveLength(2);
+  });
+
+  it("unsubscribes via the page button, and rejects unknown tokens", async () => {
+    await addSubscribers(1, "a");
+    const res = await post("/unsubscribe?t=tok-a1");
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("unsubscribed</h1>");
+    expect((await status("a1@x.test")).status).toBe("unsubscribed");
+    expect((await post("/unsubscribe?t=nope")).status).toBe(404);
+    expect((await post("/confirm?t=nope")).status).toBe(404);
   });
 
   it("rejects a bad address and a failed Turnstile check", async () => {

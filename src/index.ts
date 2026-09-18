@@ -87,8 +87,10 @@ async function turnstileOk(env: Env, response: string, ip: string | null): Promi
   body.set("secret", env.TURNSTILE_SECRET);
   body.set("response", response);
   if (ip) body.set("remoteip", ip);
-  const res = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", { method: "POST", body });
-  return res.ok && ((await res.json()) as { success: boolean }).success;
+  const res = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", { method: "POST", body }).catch(
+    (e) => (console.error("Turnstile siteverify unreachable", e), null),
+  );
+  return !!res?.ok && ((await res.json()) as { success: boolean }).success;
 }
 
 function button(action: string, label: string): string {

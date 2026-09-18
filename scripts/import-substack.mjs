@@ -12,6 +12,10 @@ for (const row of rows) {
   if (col(row, "email_disabled") === "true") continue; // already not receiving mail on Substack
   const email = col(row, "email").trim().toLowerCase();
   const consentAt = Date.parse(col(row, "created_at"));
+  if (Number.isNaN(consentAt)) {
+    console.error(`skipping ${email}: unparseable created_at`);
+    continue;
+  }
   console.log(
     `INSERT INTO subscribers (email, token, status, consent_at, consent_source) ` +
       `VALUES (${q(email)}, ${q(crypto.randomUUID())}, 'active', ${consentAt}, 'substack-import') ON CONFLICT (email) DO NOTHING;`,

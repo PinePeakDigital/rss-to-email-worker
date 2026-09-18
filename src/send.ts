@@ -27,12 +27,7 @@ export interface FeedItem {
   pubDate: number; // NaN when missing
 }
 
-interface Issue {
-  guid: string;
-  title: string;
-  link: string;
-  html: string;
-}
+type Issue = Omit<FeedItem, "pubDate">;
 
 interface Recipient {
   id: number;
@@ -56,18 +51,26 @@ export function parseFeed(xml: string): FeedItem[] {
   });
 }
 
-/** One cron tick. Safe to run concurrently with itself. */
+/**
+ * One cron tick. Overlapping ticks never double-send an issue; they can duplicate an admin alert.
+ * Each phase is isolated so one failure (say, a D1 hiccup on one issue) can't starve the rest;
+ * failures are rethrown together at the end so the cron run still shows as failed.
+ */
 export async function tick(env: Env, now = Date.now()): Promise<void> {
-  await env.DB.prepare("UPDATE batches SET status = 'flagged' WHERE status = 'in_flight' AND started_at < ?")
-    .bind(now - FLAG_AFTER_MS)
-    .run();
-  await alertFlagged(env, now);
+  const errors: unknown[] = [];
+  const attempt = (what: string, fn: () => Promise<void>) =>
+    fn().catch((e) => {
+      console.error(`${what} failed; continuing`, e);
+      errors.push(e);
+    });
 
-  try {
-    await ingestFeed(env, now);
-  } catch (e) {
-    console.error("feed ingest failed; open issues still proceed", e);
-  }
+  await attempt("flagging", async () => {
+    await env.DB.prepare("UPDATE batches SET status = 'flagged' WHERE status = 'in_flight' AND started_at < ?")
+      .bind(now - FLAG_AFTER_MS)
+      .run();
+    await alertFlagged(env, now);
+  });
+  await attempt("feed ingest", () => ingestFeed(env, now));
 
   const { results } = await env.DB.prepare(
     `SELECT guid, title, link, html FROM items
@@ -75,13 +78,18 @@ export async function tick(env: Env, now = Date.now()): Promise<void> {
        AND (done_at IS NULL OR guid IN (SELECT guid FROM batches WHERE status = 'failed'))
      ORDER BY pub_date, guid`,
   ).all<Issue>();
-  for (const issue of results) await sendIssue(env, issue, now);
+  for (const issue of results) await attempt(`issue ${issue.guid}`, () => sendIssue(env, issue, now));
+
+  if (errors.length) throw new AggregateError(errors, `${errors.length} tick phase(s) failed`);
 }
 
 async function ingestFeed(env: Env, now: number) {
   const res = await fetch(env.FEED_URL);
   if (!res.ok) throw new Error(`feed fetch: HTTP ${res.status}`);
-  const items = parseFeed(await res.text());
+  const parsed = parseFeed(await res.text());
+  // Without a guid or link there's no key to dedupe on; all such items would collide on "".
+  const items = parsed.filter((i) => i.guid);
+  if (items.length < parsed.length) console.error(`skipped ${parsed.length - items.length} feed item(s) with no guid or link`);
   if (!items.length) return;
 
   // First run: everything already in the feed counts as sent.
@@ -131,7 +139,8 @@ async function sendIssue(env: Env, issue: Issue, now: number) {
       cursor: number;
       done_at: number | null;
     }>();
-    if (!row || row.done_at) return;
+    if (!row) throw new Error(`item ${issue.guid} vanished mid-issue`); // items rows are never deleted
+    if (row.done_at) return;
     const { results } = await db
       .prepare("SELECT id, email, token FROM subscribers WHERE status = 'active' AND id > ? ORDER BY id LIMIT ?")
       .bind(row.cursor, BATCH_SIZE)
