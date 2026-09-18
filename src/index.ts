@@ -90,7 +90,13 @@ async function turnstileOk(env: Env, response: string, ip: string | null): Promi
   const res = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", { method: "POST", body }).catch(
     (e) => (console.error("Turnstile siteverify unreachable", e), null),
   );
-  return !!res?.ok && ((await res.json()) as { success: boolean }).success;
+  const result = res?.ok
+    ? ((await res.json().catch(() => null)) as { success: boolean; action?: string; hostname?: string } | null)
+    : null;
+  if (!result) return false;
+  // A token is only good for the subscribe form on our own site, not one minted elsewhere with this sitekey.
+  const site = new URL(env.SITE_URL).hostname.replace(/^www\./, "");
+  return result.success && result.action === "subscribe" && [site, `www.${site}`].includes(result.hostname ?? "");
 }
 
 function button(action: string, label: string): string {

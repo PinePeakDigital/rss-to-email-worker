@@ -56,7 +56,7 @@ beforeEach(async () => {
       calls.push(form);
       return mailgunReply(form, calls.length);
     }
-    if (url.includes("turnstile")) return Response.json({ success: true });
+    if (url.includes("turnstile")) return Response.json({ success: true, action: "subscribe", hostname: "example.com" });
     throw new Error(`unexpected fetch: ${url}`);
   });
 });
@@ -304,10 +304,21 @@ describe("subscription pages", () => {
     expect((await post("/confirm?t=nope")).status).toBe(404);
   });
 
-  it("rejects a bad address and a failed Turnstile check", async () => {
+  it("rejects a bad address, and a Turnstile token that failed or came from another form or site", async () => {
     expect((await post("/subscribe", { email: "nope", "cf-turnstile-response": "ok" })).status).toBe(400);
     vi.mocked(fetch).mockResolvedValueOnce(Response.json({ success: false }));
     expect((await post("/subscribe", { email: "a@b.co", "cf-turnstile-response": "bad" })).status).toBe(400);
+    vi.mocked(fetch).mockResolvedValueOnce(Response.json({ success: true, action: "login", hostname: "example.com" }));
+    expect((await post("/subscribe", { email: "a@b.co", "cf-turnstile-response": "other-form" })).status).toBe(400);
+    vi.mocked(fetch).mockResolvedValueOnce(Response.json({ success: true, action: "subscribe", hostname: "evil.test" }));
+    expect((await post("/subscribe", { email: "a@b.co", "cf-turnstile-response": "other-site" })).status).toBe(400);
+    vi.mocked(fetch).mockResolvedValueOnce(new Response("<html>error</html>"));
+    expect((await post("/subscribe", { email: "a@b.co", "cf-turnstile-response": "garbled" })).status).toBe(400);
     expect(await status("a@b.co")).toEqual({});
+  });
+
+  it("accepts a token from the www host", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(Response.json({ success: true, action: "subscribe", hostname: "www.example.com" }));
+    expect((await post("/subscribe", { email: "w@b.co", "cf-turnstile-response": "ok" })).status).toBe(200);
   });
 });
