@@ -122,6 +122,39 @@ describe("tick", () => {
     expect(issueCalls()).toHaveLength(4);
   });
 
+  it("alerts once about a refused batch, however many ticks retry it", async () => {
+    await addSubscribers(1, "a");
+    await publishNewPost();
+    // A proxy can answer with a whole HTML page instead of Mailgun's JSON.
+    mailgunReply = (f) => (f.has("v:batch") ? new Response(`bad key ${"x".repeat(5000)}`, { status: 401 }) : Response.json({}));
+    await tick(env, NOW);
+    await tick(env, NOW + 3600_000);
+    expect(issueCalls()).toHaveLength(2); // still retrying
+    expect(alertCalls()).toHaveLength(1);
+    expect(alertCalls()[0].get("text")).toContain("HTTP 401: bad key");
+    expect(String(alertCalls()[0].get("text")).length).toBeLessThan(1000); // body truncated
+    expect(await env.DB.prepare("SELECT failed_alerted_at FROM batches").first("failed_alerted_at")).toBe(NOW);
+
+    await tick(env, NOW + 7200_000);
+    expect(alertCalls()).toHaveLength(1);
+  });
+
+  it("retries the refused-batch alert until it sends", async () => {
+    await addSubscribers(1, "a");
+    await publishNewPost();
+    mailgunReply = (f) =>
+      f.has("v:batch")
+        ? new Response("bad key", { status: 401 })
+        : alertCalls().length === 1
+          ? new Response("no", { status: 500 }) // the first alert doesn't get through
+          : Response.json({});
+    await tick(env, NOW);
+    expect(alertCalls()).toHaveLength(1);
+    await tick(env, NOW + 3600_000);
+    await tick(env, NOW + 7200_000);
+    expect(alertCalls()).toHaveLength(2);
+  });
+
   it("flags a batch with unknown outcome, alerts once, and never resends it on its own", async () => {
     await addSubscribers(3, "a");
     await publishNewPost();

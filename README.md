@@ -12,7 +12,7 @@ This is the part worth reading, and `test/worker.test.ts` covers it.
 
 - **An item is never considered twice.** Its GUID is recorded the first time it's seen. On the first run, everything already in the feed is recorded without sending. After that, items whose `pubDate` is more than 7 days old (backfills and most renames) are recorded without sending.
 - **Each issue sends in batches, claimed in order.** A batch covers a range of subscriber IDs above the issue's cursor. A unique `(item, range start)` row plus a transaction means overlapping cron runs can't claim the same range. When no active subscriber is left above the cursor, the issue closes, so people who subscribe later don't receive old issues.
-- **Delivery is at most once.** If Mailgun returns an error, the batch is retried on the next tick. If the outcome is unknown (the Worker died or the connection dropped mid-request), the batch is **flagged**: it's never retried automatically, and you get one email with the exact command to resolve it. See [ADR 0001](docs/adr/0001-at-most-once-delivery.md). With Claude Code, the `resolve-flagged-batch` skill in `.claude/skills/` does the Mailgun log check for you.
+- **Delivery is at most once.** If Mailgun returns an error, the batch is retried on the next tick and you get one email naming the batch and what Mailgun said. If the outcome is unknown (the Worker died or the connection dropped mid-request), the batch is **flagged**: it's never retried automatically, and you get one email with the exact command to resolve it. See [ADR 0001](docs/adr/0001-at-most-once-delivery.md). With Claude Code, the `resolve-flagged-batch` skill in `.claude/skills/` does the Mailgun log check for you.
 
 The domain vocabulary is defined in [CONTEXT.md](CONTEXT.md).
 
