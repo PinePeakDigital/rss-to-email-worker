@@ -27,8 +27,7 @@ export const MAX_BATCH_SIZE = 1000;
 // the budget is gone and the next one resumes from the cursor; without this, every row still
 // in flight when the Worker is killed would be flagged.
 export const SEND_BUDGET_MS = 10 * 60 * 1000;
-// Sized to leave D1's per-invocation query budget to sending: this costs one read plus one write
-// per subscriber suppressed, and the remainder waits for the next tick.
+// Keeps suppression from eating a whole tick's queries; the remainder waits for the next one.
 export const MAX_SUPPRESSIONS_PER_TICK = 50;
 export const SUPPRESSION_PAGE_SIZE = 1000; // Mailgun's maximum for these lists
 export const SUPPRESSION_PAGES = 5;
@@ -36,18 +35,61 @@ export const SUPPRESSION_PAGES = 5;
 // loop, not per tick: a streak on one issue says nothing about the next one, and sharing the count
 // would let a few permanently bad addresses block every issue published afterwards.
 export const MAX_CONSECUTIVE_FAILURES = 5;
-// D1 allows 1,000 queries per Worker invocation, and every statement in a batch() counts as one.
-// Claiming and sending one range costs five (two selects, a two-statement batch, the status update),
-// so the ceiling is near 200 — well below Cloudflare's 10,000 subrequests, which is not the binding
-// limit here. Exceeding D1's throws mid-send and strands a claimed range; stopping short defers
-// cleanly to the next tick. The rest of the budget covers flagging, alerts and feed ingest, whose
-// cost grows with the number of items in the feed.
-export const MAX_SENDS_PER_TICK = 150;
+// D1 allows this many queries per Worker invocation on the Workers Paid plan, and every statement
+// in a batch() counts as one. (The Free plan allows 50, which this worker would exceed on any real
+// list; it assumes Paid, as it did before.) Exceeding the limit throws mid-send and strands a
+// claimed range, which becomes a flagged batch somebody resolves by hand (docs/adr/0001), so every
+// phase whose cost grows — feed ingest, suppression, the admin alerts, sending — calls afford() or
+// spend() before it queries and yields to the next tick when refused. Well below Cloudflare's 10,000 subrequests,
+// which is not the binding limit here.
+export const D1_QUERY_LIMIT = 1000;
+// D1 binds at most this many parameters to one query, so a lookup over the feed goes in chunks.
+export const D1_MAX_BOUND_PARAMS = 100;
+// Held back for the one-off reads no phase charges for: the flagging UPDATE, the scan for unalerted
+// flagged batches, the seeding probe, the suppression list read, and the scan for open issues — a
+// handful, and a fixed handful. Everything whose cost grows with its input charges the budget.
+export const QUERY_RESERVE = 60;
+// Charged in two parts, so a pass that finds the issue finished doesn't pay for a send it never
+// makes: the cursor read and the recipient select, then the two-statement claim and the status
+// update that resolves it. A retry pass costs the claim half exactly — its own claiming UPDATE,
+// the recipient select, and the status update.
+export const QUERIES_PER_PROBE = 2;
+export const QUERIES_PER_CLAIM = 3;
+export const QUERIES_PER_SEND = QUERIES_PER_PROBE + QUERIES_PER_CLAIM;
 
 /** What a tick has left to spend. Mutated as it proceeds. */
-interface Run {
+interface Budget {
   deadline: number;
-  sendsLeft: number;
+  queriesLeft: number;
+}
+
+/**
+ * Charges up to `want` queries against the tick, returning how many it got — 0 once the wall-clock
+ * budget is gone. For work that can do less than it asked for: an insert batch or a set of
+ * suppression writes that is happy to leave the remainder to the next tick. Work that needs the
+ * whole amount calls afford() instead. Between them they are the only place the per-invocation
+ * ceiling and the deadline are known, so no phase carries its own cap.
+ */
+function spend(budget: Budget, want: number): number {
+  if (Date.now() > budget.deadline) return 0;
+  const got = Math.min(Math.max(want, 0), budget.queriesLeft);
+  budget.queriesLeft -= got;
+  return got;
+}
+
+/**
+ * Whether the tick can afford all of `n`, charging it when so and nothing when not. All-or-nothing
+ * on purpose: work that needs the whole amount would otherwise leave a part-charge behind for the
+ * next phase to find missing, having done nothing with it.
+ */
+function afford(budget: Budget, n: number): boolean {
+  if (budget.queriesLeft < n || Date.now() > budget.deadline) return false;
+  budget.queriesLeft -= n;
+  return true;
+}
+
+export function newBudget(limit: Partial<Budget> = {}): Budget {
+  return { deadline: Date.now() + SEND_BUDGET_MS, queriesLeft: D1_QUERY_LIMIT - QUERY_RESERVE, ...limit };
 }
 
 /** Folds a send's outcome into a refusal streak. A send that made no call is neither. */
@@ -60,9 +102,13 @@ function giveUp(refusals: number, what: string): void {
   if (refusals >= MAX_CONSECUTIVE_FAILURES) console.error(`gave up ${what}: ${refusals} sends refused in a row`);
 }
 
-/** Whether the tick is out of budget. Refusal streaks are tracked per send loop, not here. */
-function outOfBudget(run: Run): boolean {
-  return run.sendsLeft <= 0 || Date.now() > run.deadline;
+/**
+ * Peeks at whether the cheapest useful unit of work is still affordable — a retry claim, which
+ * costs less than a fresh one because the range is already known. Refusal streaks are tracked per
+ * send loop, not here.
+ */
+function outOfBudget(budget: Budget): boolean {
+  return budget.queriesLeft < QUERIES_PER_CLAIM || Date.now() > budget.deadline;
 }
 
 export function batchSize(env: Env): number {
@@ -113,11 +159,11 @@ export function parseFeed(xml: string): FeedItem[] {
  * Each phase is isolated so one failure (say, a D1 hiccup on one issue) can't starve the rest;
  * failures are rethrown together at the end so the cron run still shows as failed.
  */
-export async function tick(env: Env, now = Date.now(), budget: Partial<Run> = {}): Promise<void> {
+export async function tick(env: Env, now = Date.now(), limit: Partial<Budget> = {}): Promise<void> {
   const errors: unknown[] = [];
   // Shared across every issue in this tick, so a provider that is down is reported once, not once
   // per recipient, and the wall-clock budget covers the whole run rather than each issue.
-  const run: Run = { deadline: Date.now() + SEND_BUDGET_MS, sendsLeft: MAX_SENDS_PER_TICK, ...budget };
+  const budget = newBudget(limit);
   const attempt = (what: string, fn: () => Promise<void>) =>
     fn().catch((e) => {
       console.error("tick phase failed; continuing:", what, e); // what may hold a feed guid: keep it out of the format string
@@ -128,12 +174,12 @@ export async function tick(env: Env, now = Date.now(), budget: Partial<Run> = {}
     await env.DB.prepare("UPDATE batches SET status = 'flagged' WHERE status = 'in_flight' AND started_at < ?")
       .bind(now - FLAG_AFTER_MS)
       .run();
-    await alertFlagged(env, now);
+    await alertFlagged(env, now, budget);
   });
-  await attempt("feed ingest", () => ingestFeed(env, now));
+  await attempt("feed ingest", () => ingestFeed(env, now, budget));
   await attempt("suppressions", async () => {
     const { entries, failures } = await fetchSuppressions(env);
-    await suppress(env, entries, now);
+    await suppress(env, entries, now, budget);
     // Reported like a feed failure: sending is unaffected, but a permanently dead suppression
     // phase — a wrong path, a revoked key — is worth surfacing as a failed cron run.
     if (failures.length) throw new Error(`could not read Mailgun suppression lists: ${failures.join("; ")}`);
@@ -146,19 +192,19 @@ export async function tick(env: Env, now = Date.now(), budget: Partial<Run> = {}
      ORDER BY pub_date, guid`,
   ).all<Issue>();
   for (const issue of results) {
-    if (outOfBudget(run)) break;
-    await attempt(`issue ${issue.guid}`, () => sendIssue(env, issue, now, run));
+    if (outOfBudget(budget)) break;
+    await attempt(`issue ${issue.guid}`, () => sendIssue(env, issue, now, budget));
   }
-  if (outOfBudget(run)) {
+  if (outOfBudget(budget)) {
     console.error(
-      `tick out of ${run.sendsLeft <= 0 ? "sends" : "time"} with issues left to send; the next tick resumes`,
+      `tick out of ${Date.now() > budget.deadline ? "time" : "queries"} with issues left to send; the next tick resumes`,
     );
   }
 
   if (errors.length) throw new AggregateError(errors, `${errors.length} tick phase(s) failed`);
 }
 
-async function ingestFeed(env: Env, now: number) {
+async function ingestFeed(env: Env, now: number, budget: Budget) {
   const res = await fetch(env.FEED_URL);
   if (!res.ok) throw new Error(`feed fetch: HTTP ${res.status}`);
   const parsed = parseFeed(await res.text());
@@ -167,10 +213,35 @@ async function ingestFeed(env: Env, now: number) {
   if (items.length < parsed.length) console.error(`skipped ${parsed.length - items.length} feed item(s) with no guid or link`);
   if (!items.length) return;
 
-  // First run: everything already in the feed counts as sent.
+  // First budget: everything already in the feed counts as sent.
   const seeding = !(await env.DB.prepare("SELECT 1 FROM items LIMIT 1").first());
+  // A feed republishes its whole contents every tick. Inserting every item and letting ON CONFLICT
+  // discard it would spend one query per item per tick forever, which on a long feed leaves nothing
+  // for sending. Asking which are already held costs one query per hundred instead, and after the
+  // first tick the answer is usually all of them.
+  const lookups = Math.ceil(items.length / D1_MAX_BOUND_PARAMS);
+  if (!afford(budget, lookups)) return; // the next tick reads the feed again
+  const seen = new Set<string>();
+  for (let i = 0; i < items.length; i += D1_MAX_BOUND_PARAMS) {
+    const chunk = items.slice(i, i + D1_MAX_BOUND_PARAMS);
+    const { results } = await env.DB.prepare(
+      `SELECT guid FROM items WHERE guid IN (${chunk.map(() => "?").join(",")})`,
+    )
+      .bind(...chunk.map((c) => c.guid))
+      .all<{ guid: string }>();
+    for (const r of results) seen.add(r.guid);
+  }
+  const fresh = items.filter((i) => !seen.has(i.guid));
+  if (!fresh.length) return;
+
+  const room = spend(budget, fresh.length);
+  // A partial seed is not safe: whatever was left out would be inserted by a later tick as a new
+  // item and emailed. Nothing else competes for the budget on a first budget, so falling short here
+  // means the feed is implausibly long, not that the tick was busy.
+  if (seeding && room < fresh.length) throw new Error(`feed has ${fresh.length} items, too many to seed in one tick`);
+  if (!room) return; // the tick is spent; the next one ingests these
   await env.DB.batch(
-    items.map((i) => {
+    fresh.slice(0, room).map((i) => {
       // NaN pubDate isn't stale: an undated item is treated as new.
       const issue = !seeding && !(i.pubDate < now - STALE_MS);
       return env.DB.prepare(
@@ -189,21 +260,27 @@ async function ingestFeed(env: Env, now: number) {
   );
 }
 
-async function sendIssue(env: Env, issue: Issue, now: number, run: Run) {
-  const db = env.DB;
+/** A range of subscribers taken by this tick, in flight and owed a delivery. */
+interface Claim {
+  batchId: number;
+  recipients: Recipient[];
+}
 
-  const failed = await db
+/**
+ * Re-claims the ranges a previous tick handed to Mailgun and had refused. Ends the issue's retry
+ * phase, not the issue: addresses that always fail would otherwise stop it reaching anyone new.
+ */
+async function* retryClaims(env: Env, issue: Issue, now: number, budget: Budget): AsyncGenerator<Claim> {
+  const db = env.DB;
+  // Charged: this runs once per open issue, so a long backlog of them would otherwise be the one
+  // term left that grows without asking.
+  if (!afford(budget, 1)) return;
+  const { results: failed } = await db
     .prepare("SELECT id, after_id, last_id FROM batches WHERE guid = ? AND status = 'failed'")
     .bind(issue.guid)
     .all<{ id: number; after_id: number; last_id: number }>();
-  let refusals = 0; // this loop's streak only
-  for (const b of failed.results) {
-    if (outOfBudget(run)) return;
-    if (refusals >= MAX_CONSECUTIVE_FAILURES) {
-      // Addresses that always fail would otherwise stop this issue reaching anyone new.
-      giveUp(refusals, `retrying ${issue.guid}`);
-      break;
-    }
+  for (const b of failed) {
+    if (!afford(budget, QUERIES_PER_CLAIM)) return;
     const claim = await db
       .prepare("UPDATE batches SET status = 'in_flight', started_at = ? WHERE id = ? AND status = 'failed'")
       .bind(now, b.id)
@@ -213,13 +290,15 @@ async function sendIssue(env: Env, issue: Issue, now: number, run: Run) {
       .prepare("SELECT id, email, token FROM subscribers WHERE status = 'active' AND id > ? AND id <= ? ORDER BY id")
       .bind(b.after_id, b.last_id)
       .all<Recipient>();
-    refusals = streak(refusals, await deliver(env, issue, b.id, results, run));
+    yield { batchId: b.id, recipients: results };
   }
+}
 
-  refusals = 0;
+/** Walks the issue's cursor forward, claiming one range of active subscribers at a time. */
+async function* freshClaims(env: Env, issue: Issue, now: number, budget: Budget): AsyncGenerator<Claim> {
+  const db = env.DB;
   for (;;) {
-    if (outOfBudget(run)) return;
-    if (refusals >= MAX_CONSECUTIVE_FAILURES) return giveUp(refusals, `sending ${issue.guid}`);
+    if (!afford(budget, QUERIES_PER_PROBE)) return;
     const row = await db.prepare("SELECT cursor, done_at FROM items WHERE guid = ?").bind(issue.guid).first<{
       cursor: number;
       done_at: number | null;
@@ -231,6 +310,9 @@ async function sendIssue(env: Env, issue: Issue, now: number, run: Run) {
       .bind(row.cursor, batchSize(env))
       .all<Recipient>();
     if (!results.length) {
+      // Charged but not gated: the issue is finished, and refusing this one write would leave it
+      // open for every later tick to rediscover.
+      spend(budget, 1);
       // The cursor check keeps a concurrent tick's fresh claim from being closed over.
       await db
         .prepare("UPDATE items SET done_at = ? WHERE guid = ? AND cursor = ?")
@@ -238,6 +320,7 @@ async function sendIssue(env: Env, issue: Issue, now: number, run: Run) {
         .run();
       return;
     }
+    if (!afford(budget, QUERIES_PER_CLAIM)) return; // next tick claims this range
 
     const lastId = results[results.length - 1].id;
     // Both statements no-op if a concurrent tick already claimed this range.
@@ -251,20 +334,37 @@ async function sendIssue(env: Env, issue: Issue, now: number, run: Run) {
     ]);
     const claimed = ins.results[0] as { id: number } | undefined;
     if (!claimed) return;
-    refusals = streak(refusals, await deliver(env, issue, claimed.id, results, run));
+    yield { batchId: claimed.id, recipients: results };
   }
+}
+
+/**
+ * Delivers everything one source claims, stopping that source once the provider has refused
+ * MAX_CONSECUTIVE_FAILURES in a row. The streak is checked before the next claim is pulled: a
+ * claimed range is already in flight, so abandoning one would strand it into a flagged batch.
+ */
+async function deliverClaims(env: Env, issue: Issue, claims: AsyncGenerator<Claim>, what: string): Promise<void> {
+  let refusals = 0; // this source's streak only
+  for (;;) {
+    if (refusals >= MAX_CONSECUTIVE_FAILURES) return giveUp(refusals, what);
+    const { value, done } = await claims.next();
+    if (done) return;
+    refusals = streak(refusals, await deliver(env, issue, value.batchId, value.recipients));
+  }
+}
+
+async function sendIssue(env: Env, issue: Issue, now: number, budget: Budget) {
+  await deliverClaims(env, issue, retryClaims(env, issue, now, budget), `retrying ${issue.guid}`);
+  await deliverClaims(env, issue, freshClaims(env, issue, now, budget), `sending ${issue.guid}`);
 }
 
 /**
  * Sends one claimed batch. Leaves it in_flight when the outcome is unknown.
  * Returns whether the provider accepted it, or null when there was nothing to send.
  */
-async function deliver(env: Env, issue: Issue, batchId: number, recipients: Recipient[], run: Run): Promise<boolean | null> {
+async function deliver(env: Env, issue: Issue, batchId: number, recipients: Recipient[]): Promise<boolean | null> {
   let status = "sent"; // an empty retry range (everyone unsubscribed) is trivially sent
   let sent: boolean | null = null;
-  // Charged even when there is nobody left to send to: claiming the range already cost the queries,
-  // and a backlog of emptied ranges would otherwise spin without ever exhausting the budget.
-  run.sendsLeft--;
   if (recipients.length) {
     let res: Response;
     try {
@@ -418,16 +518,16 @@ ${fitImages(issue.html)}
  * Stops sending to addresses the provider has suppressed, recording which of the two it was.
  *
  * Reads our own list first and writes only for addresses we actually hold: the suppression list
- * grows forever and can be far larger than the subscriber list, and D1 counts every statement in a
- * batch against its 1,000-per-invocation ceiling. Applying at most MAX_SUPPRESSIONS_PER_TICK keeps
- * this bounded alongside the send budget; the rest are picked up next tick, since the lists are
- * re-read every time and applying them twice is a no-op.
+ * grows forever and can be far larger than the subscriber list, and every write costs a query the
+ * tick could have spent sending. Applies at most MAX_SUPPRESSIONS_PER_TICK, and no more than the
+ * tick can afford; the rest are picked up next tick, since the lists are re-read every time and
+ * applying them twice is a no-op.
  *
  * Pending rows are included: a typo'd address that bounced would otherwise sit pending forever,
  * collecting a fresh confirmation email on every attempt to subscribe.
  * Returns how many subscribers this changed.
  */
-export async function suppress(env: Env, entries: Suppression[], now: number): Promise<number> {
+export async function suppress(env: Env, entries: Suppression[], now: number, budget: Budget): Promise<number> {
   if (!entries.length) return 0;
   // Complaint wins when an address is on both lists: it is the more meaningful of the two.
   const reasons = new Map<string, Suppression["reason"]>();
@@ -439,7 +539,8 @@ export async function suppress(env: Env, entries: Suppression[], now: number): P
   const { results } = await env.DB.prepare("SELECT email FROM subscribers WHERE status IN ('active', 'pending')").all<{
     email: string;
   }>();
-  const hits = results.filter((r) => reasons.has(r.email)).slice(0, MAX_SUPPRESSIONS_PER_TICK);
+  const matched = results.filter((r) => reasons.has(r.email));
+  const hits = matched.slice(0, spend(budget, Math.min(matched.length, MAX_SUPPRESSIONS_PER_TICK)));
   if (!hits.length) return 0;
 
   await env.DB.batch(
@@ -462,11 +563,18 @@ export async function suppress(env: Env, entries: Suppression[], now: number): P
   return hits.length;
 }
 
-async function alertFlagged(env: Env, now: number) {
+async function alertFlagged(env: Env, now: number, budget: Budget) {
   const { results } = await env.DB.prepare(
     "SELECT id, guid, after_id, last_id, started_at FROM batches WHERE status = 'flagged' AND alerted_at IS NULL",
   ).all<{ id: number; guid: string; after_id: number; last_id: number; started_at: number }>();
   for (const b of results) {
+    // One alert costs one write. Charged like any other growing phase: a provider outage can leave
+    // a tick's worth of flagged batches behind, and alerting on all of them unbudgeted would spend
+    // the queries the next phase is about to claim a range with.
+    if (!afford(budget, 1)) {
+      console.error("out of queries before alerting every flagged batch; the next tick resumes");
+      return;
+    }
     const sql = (status: string) =>
       `npx wrangler d1 execute DB --remote --command "UPDATE batches SET status = '${status}' WHERE id = ${b.id} AND status = 'flagged'"`;
     const form = new FormData();
@@ -486,7 +594,7 @@ If Mailgun accepted it:
 If it did not (the next tick resends it):
   ${sql("failed")}
 
-Or run the resolve-flagged-batch skill in this repo with Claude Code.
+Or budget the resolve-flagged-batch skill in this repo with Claude Code.
 `,
     );
     const res = await mailgun(env, form).catch((e) => (console.error("alert send failed", e), null));
