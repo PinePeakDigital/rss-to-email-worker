@@ -382,13 +382,31 @@ export function esc(s: string): string {
   return s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 }
 
+/**
+ * Constrains images to the email's width.
+ *
+ * Feed HTML is written for a web page, where a stylesheet sizes images and a `width` attribute
+ * only prevents layout shift. An email has no stylesheet — clients strip <style> — so an image
+ * declaring width="1024" renders at 1024px and pushes the whole layout wider than the body. The
+ * declaration goes last so it wins over any the feed already set.
+ */
+export function fitImages(html: string): string {
+  const fit = "max-width:100%;height:auto";
+  return html.replace(/<img\b([^>]*?)(\/?)>/gi, (_tag, attrs: string, selfClose: string) => {
+    const withStyle = attrs.replace(/(\sstyle\s*=\s*)(["'])([\s\S]*?)\2/i, (_m, lead, quote, value) =>
+      `${lead}${quote}${value.replace(/;\s*$/, "")};${fit}${quote}`,
+    );
+    return `<img${withStyle === attrs ? `${attrs} style="${fit}"` : withStyle}${selfClose}>`;
+  });
+}
+
 function renderIssue(env: Env, issue: Issue, unsubscribe: string): string {
   // Email clients strip <style>; inline styles only. Light regardless of the site's theme.
   return `<!doctype html><html><body style="margin:0;padding:0;background:#ffffff;color:#1a1a1a">
 <div style="max-width:640px;margin:0 auto;padding:24px 16px;font:16px/1.6 Georgia,serif">
 <p style="font:13px sans-serif;color:#666"><a href="${esc(issue.link)}" style="color:#666">Read on the web</a></p>
 <h1 style="font-size:28px;line-height:1.25;margin:0 0 24px">${esc(issue.title)}</h1>
-${issue.html}
+${fitImages(issue.html)}
 <hr style="border:none;border-top:1px solid #ddd;margin:32px 0 16px">
 <p style="font:13px sans-serif;color:#666">You're getting this because you subscribed to
 <a href="${esc(env.SITE_URL)}" style="color:#666">${esc(env.SITE_NAME)}</a>.
