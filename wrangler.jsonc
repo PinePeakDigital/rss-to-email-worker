@@ -27,6 +27,9 @@
     "ADMIN_EMAIL": "you@example.com",
     "MAILGUN_DOMAIN": "mail.example.com",
     // EU-region Mailgun accounts: https://api.eu.mailgun.net
-    "MAILGUN_API_BASE": "https://api.mailgun.net"
+    "MAILGUN_API_BASE": "https://api.mailgun.net",
+    // Recipients per Mailgun call. 1 sends individually, which new sending domains are allowed to
+    // do; raise it (max 1000) only once yours is cleared for batch sending.
+    "BATCH_SIZE": 1
   }
 }

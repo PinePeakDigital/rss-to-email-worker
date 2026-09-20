@@ -3,7 +3,7 @@
 Emails new items from an RSS feed to double-opt-in subscribers. It runs on Cloudflare Workers and D1, and sends through Mailgun. Built for the [Narthur Online](https://nathanarthur.com) newsletter, and configurable for any feed.
 
 - **Subscribe:** an HTML form on your site, protected by Turnstile, with double opt-in. The consent time and source are recorded.
-- **Send:** an hourly cron fetches the feed and emails each new item, as a full post in a light template, to every active subscriber. It uses Mailgun batch sending, 1,000 recipients per call.
+- **Send:** an hourly cron fetches the feed and emails each new item, as a full post in a light template, to every active subscriber. It sends one message per recipient by default, because Mailgun refuses batch sends from a domain it hasn't cleared yet — silently enough to be easy to miss. Set `BATCH_SIZE` up to 1,000 to batch once yours is cleared.
 - **Unsubscribe:** a tokenized link in every email, plus RFC 8058 one-click `List-Unsubscribe` headers, which Gmail and Yahoo require from bulk senders.
 
 ## How sending stays correct
@@ -11,7 +11,8 @@ Emails new items from an RSS feed to double-opt-in subscribers. It runs on Cloud
 This is the part worth reading, and `test/worker.test.ts` covers it.
 
 - **An item is never considered twice.** Its GUID is recorded the first time it's seen. On the first run, everything already in the feed is recorded without sending. After that, items whose `pubDate` is more than 7 days old (backfills and most renames) are recorded without sending.
-- **Each issue sends in batches, claimed in order.** A batch covers a range of subscriber IDs above the issue's cursor. A unique `(item, range start)` row plus a transaction means overlapping cron runs can't claim the same range. When no active subscriber is left above the cursor, the issue closes, so people who subscribe later don't receive old issues.
+- **Each issue sends in batches, claimed in order.** A batch covers a range of subscriber IDs above the issue's cursor — one ID at the default `BATCH_SIZE` of 1. A unique `(item, range start)` row plus a transaction means overlapping cron runs can't claim the same range. When no active subscriber is left above the cursor, the issue closes, so people who subscribe later don't receive old issues.
+- **A long list spreads over ticks.** Sending is sequential, so a tick stops after ten minutes and the next one resumes from the cursor, rather than being killed mid-issue by the cron wall-clock limit — which would leave every claimed range flagged. A tick also gives up after five refusals in a row, so a revoked key costs you five log lines instead of one per subscriber.
 - **Delivery is at most once.** If Mailgun returns an error, the batch is retried on the next tick. If the outcome is unknown (the Worker died or the connection dropped mid-request), the batch is **flagged**: it's never retried automatically, and you get one email with the exact command to resolve it. See [ADR 0001](docs/adr/0001-at-most-once-delivery.md). With Claude Code, the `resolve-flagged-batch` skill in `.claude/skills/` does the Mailgun log check for you.
 
 The domain vocabulary is defined in [CONTEXT.md](CONTEXT.md).

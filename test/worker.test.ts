@@ -1,7 +1,7 @@
 import { env } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index";
-import { FLAG_AFTER_MS, parseFeed, STALE_MS, tick } from "../src/send";
+import { batchSize, DEFAULT_BATCH_SIZE, FLAG_AFTER_MS, MAX_CONSECUTIVE_FAILURES, parseFeed, STALE_MS, tick } from "../src/send";
 
 const NOW = Date.parse("2026-09-18T12:00:00Z");
 const DAY = 24 * 60 * 60 * 1000;
@@ -23,6 +23,8 @@ let mailgunReply: (form: FormData, n: number) => Response | Promise<Response>;
 const issueCalls = () => calls.filter((f) => f.has("v:batch"));
 const alertCalls = () => calls.filter((f) => f.get("to") === env.ADMIN_EMAIL);
 const recipients = () => issueCalls().flatMap((f) => f.getAll("to") as string[]);
+/** The opt-in path: one provider call per 1000 recipients, as before individual sending. */
+const batched = { ...env, BATCH_SIZE: 1000 };
 
 async function addSubscribers(n: number, prefix: string, status = "active") {
   await env.DB.prepare(
@@ -83,12 +85,16 @@ describe("tick", () => {
     await tick(env, NOW + 3600_000);
 
     expect(recipients().sort()).toEqual(["a1@x.test", "a2@x.test", "a3@x.test"]);
-    const form = issueCalls()[0];
+    expect(issueCalls()).toHaveLength(3); // one call per recipient, not one batch
+    const form = issueCalls()[1];
+    expect(form.getAll("to")).toEqual(["a2@x.test"]);
     expect(form.get("subject")).toBe("Post new");
     expect(form.get("html")).toContain("<p>Body of new</p>");
-    expect(form.get("h:List-Unsubscribe")).toBe(`<${env.PUBLIC_URL}/unsubscribe?t=%recipient.token%>`);
+    // The real token, not a batch substitution variable, and no recipient-variables at all.
+    expect(form.get("h:List-Unsubscribe")).toBe(`<${env.PUBLIC_URL}/unsubscribe?t=tok-a2>`);
+    expect(form.get("html")).toContain(`${env.PUBLIC_URL}/unsubscribe?t=tok-a2`);
     expect(form.get("h:List-Unsubscribe-Post")).toBe("List-Unsubscribe=One-Click");
-    expect(JSON.parse(form.get("recipient-variables") as string)["a2@x.test"]).toEqual({ token: "tok-a2" });
+    expect(form.has("recipient-variables")).toBe(false);
   });
 
   it("never sends a stale item", async () => {
@@ -107,10 +113,10 @@ describe("tick", () => {
     await addSubscribers(2500, "a");
     await publishNewPost();
     mailgunReply = (_f, n) => (n === 2 ? new Response("boom", { status: 500 }) : Response.json({}));
-    await tick(env, NOW);
+    await tick(batched, NOW);
     expect(issueCalls()).toHaveLength(3);
 
-    await tick(env, NOW + 3600_000);
+    await tick(batched, NOW + 3600_000);
     expect(issueCalls()).toHaveLength(4);
     expect(issueCalls()[3].getAll("to")).toEqual(issueCalls()[1].getAll("to"));
 
@@ -118,12 +124,12 @@ describe("tick", () => {
     expect(delivered).toHaveLength(2500);
     expect(new Set(delivered).size).toBe(2500);
 
-    await tick(env, NOW + 7200_000);
+    await tick(batched, NOW + 7200_000);
     expect(issueCalls()).toHaveLength(4);
   });
 
-  it("flags a batch with unknown outcome, alerts once, and never resends it on its own", async () => {
-    await addSubscribers(3, "a");
+  it("flags a send with unknown outcome, alerts once, and never resends it on its own", async () => {
+    await addSubscribers(1, "a");
     await publishNewPost();
     mailgunReply = () => {
       throw new Error("connection reset");
@@ -144,7 +150,7 @@ describe("tick", () => {
     await env.DB.prepare("UPDATE batches SET status = 'failed' WHERE status = 'flagged'").run();
     await tick(env, NOW + 3 * FLAG_AFTER_MS);
     expect(issueCalls()).toHaveLength(2);
-    expect(issueCalls()[1].getAll("to")).toEqual(["a1@x.test", "a2@x.test", "a3@x.test"]);
+    expect(issueCalls()[1].getAll("to")).toEqual(["a1@x.test"]);
   });
 
   it("includes subscribers who confirm mid-issue and skips those who leave", async () => {
@@ -193,13 +199,13 @@ describe("tick", () => {
     await addSubscribers(2500, "a");
     await publishNewPost();
     mailgunReply = (_f, n) => (n === 2 ? new Response("boom", { status: 500 }) : Response.json({}));
-    await tick(env, NOW);
-    await Promise.all([tick(env, NOW + 3600_000), tick(env, NOW + 3600_000)]);
+    await tick(batched, NOW);
+    await Promise.all([tick(batched, NOW + 3600_000), tick(batched, NOW + 3600_000)]);
     expect(issueCalls()).toHaveLength(4);
   });
 
   it("marks a retried batch sent without calling Mailgun when everyone in it has left", async () => {
-    await addSubscribers(3, "a");
+    await addSubscribers(1, "a");
     await publishNewPost();
     mailgunReply = () => new Response("boom", { status: 500 });
     await tick(env, NOW);
@@ -241,6 +247,59 @@ describe("tick", () => {
     await Promise.all([tick(env, NOW), tick(env, NOW), tick(env, NOW)]);
     expect(recipients()).toHaveLength(2500);
     expect(new Set(recipients()).size).toBe(2500);
+  });
+
+  it("resends only the individual recipient the provider refused", async () => {
+    await addSubscribers(3, "a");
+    await publishNewPost();
+    mailgunReply = (f) => (f.getAll("to").includes("a2@x.test") ? new Response("boom", { status: 500 }) : Response.json({}));
+    await tick(env, NOW);
+    expect(recipients()).toEqual(["a1@x.test", "a2@x.test", "a3@x.test"]);
+
+    mailgunReply = () => Response.json({});
+    await tick(env, NOW + 3600_000);
+    expect(recipients().slice(3)).toEqual(["a2@x.test"]); // only the refused one comes back
+
+    await tick(env, NOW + 7200_000);
+    expect(issueCalls()).toHaveLength(4);
+  });
+
+  it("stops when the send budget is spent and resumes on the next tick", async () => {
+    await addSubscribers(3, "a");
+    await publishNewPost();
+    await tick(env, NOW, Date.now() - 1); // budget already gone
+    expect(issueCalls()).toHaveLength(0);
+
+    await tick(env, NOW + 3600_000);
+    expect(recipients().sort()).toEqual(["a1@x.test", "a2@x.test", "a3@x.test"]);
+  });
+
+  it("gives up for this tick once the provider refuses several sends in a row", async () => {
+    await addSubscribers(20, "a");
+    await publishNewPost();
+    mailgunReply = () => new Response("bad key", { status: 401 });
+    await tick(env, NOW);
+    // Stops at the streak limit instead of logging once per subscriber.
+    expect(issueCalls()).toHaveLength(MAX_CONSECUTIVE_FAILURES);
+  });
+
+  it("keeps going when failures are not consecutive", async () => {
+    await addSubscribers(20, "a");
+    await publishNewPost();
+    mailgunReply = (_f, n) => (n % 2 === 0 ? new Response("boom", { status: 500 }) : Response.json({}));
+    await tick(env, NOW);
+    expect(issueCalls()).toHaveLength(20); // every other one fails, so the streak never reaches the limit
+  });
+});
+
+describe("batchSize", () => {
+  it("defaults to one and clamps anything out of range", () => {
+    expect(batchSize(env)).toBe(DEFAULT_BATCH_SIZE);
+    expect(batchSize({ ...env, BATCH_SIZE: 1000 })).toBe(1000);
+    expect(batchSize({ ...env, BATCH_SIZE: "250" })).toBe(250);
+    for (const bad of [0, -5, 1001, 2.5, "abc", ""]) {
+      expect(batchSize({ ...env, BATCH_SIZE: bad })).toBe(DEFAULT_BATCH_SIZE);
+    }
   });
 });
 
