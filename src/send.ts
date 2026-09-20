@@ -46,9 +46,8 @@ export const D1_QUERY_LIMIT = 1000;
 // D1 binds at most this many parameters to one query, so a lookup over the feed goes in chunks.
 export const D1_MAX_BOUND_PARAMS = 100;
 // Held back for the one-off reads no phase charges for: the flagging UPDATE, the scan for unalerted
-// flagged batches, the seeding probe, the suppression list read, the scan for open issues, and one
-// scan for failed ranges per open issue — so a handful, plus one per issue open at once. Everything
-// whose cost grows with its input charges the budget instead.
+// flagged batches, the seeding probe, the suppression list read, and the scan for open issues — a
+// handful, and a fixed handful. Everything whose cost grows with its input charges the budget.
 export const QUERY_RESERVE = 60;
 // Charged in two parts, so a pass that finds the issue finished doesn't pay for a send it never
 // makes: the cursor read and the recipient select, then the two-statement claim and the status
@@ -103,9 +102,13 @@ function giveUp(refusals: number, what: string): void {
   if (refusals >= MAX_CONSECUTIVE_FAILURES) console.error(`gave up ${what}: ${refusals} sends refused in a row`);
 }
 
-/** Peeks at whether anything is left to spend. Refusal streaks are tracked per send loop, not here. */
+/**
+ * Peeks at whether the cheapest useful unit of work is still affordable — a retry claim, which
+ * costs less than a fresh one because the range is already known. Refusal streaks are tracked per
+ * send loop, not here.
+ */
 function outOfBudget(budget: Budget): boolean {
-  return budget.queriesLeft < QUERIES_PER_SEND || Date.now() > budget.deadline;
+  return budget.queriesLeft < QUERIES_PER_CLAIM || Date.now() > budget.deadline;
 }
 
 export function batchSize(env: Env): number {
@@ -269,6 +272,9 @@ interface Claim {
  */
 async function* retryClaims(env: Env, issue: Issue, now: number, budget: Budget): AsyncGenerator<Claim> {
   const db = env.DB;
+  // Charged: this runs once per open issue, so a long backlog of them would otherwise be the one
+  // term left that grows without asking.
+  if (!afford(budget, 1)) return;
   const { results: failed } = await db
     .prepare("SELECT id, after_id, last_id FROM batches WHERE guid = ? AND status = 'failed'")
     .bind(issue.guid)

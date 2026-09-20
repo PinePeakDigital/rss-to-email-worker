@@ -29,10 +29,11 @@ const recipients = () => issueCalls().flatMap((f) => f.getAll("to") as string[])
 /** The opt-in path: one provider call per 1000 recipients, as before individual sending. */
 const batched = { ...env, BATCH_SIZE: 1000 };
 /**
- * A tick budget affording exactly n claimed ranges. The 2 is what ingest spends in these setups:
- * one lookup over the feed's guids, and one insert for the single new item.
+ * A tick budget affording exactly n claimed ranges of the one open issue. The 3 is what these
+ * setups spend before sending: ingest's lookup over the feed's guids, its insert for the single new
+ * item, and the scan for ranges that issue had refused.
  */
-const affords = (n: number) => ({ queriesLeft: n * QUERIES_PER_SEND + 2 });
+const affords = (n: number) => ({ queriesLeft: n * QUERIES_PER_SEND + 3 });
 
 async function addSubscribers(n: number, prefix: string, status = "active") {
   await env.DB.prepare(
@@ -384,8 +385,8 @@ describe("tick", () => {
     // the D1 queries that claiming them spent, so the budget must stop after two of the three.
     await env.DB.prepare("UPDATE subscribers SET status = 'unsubscribed'").run();
     mailgunReply = () => Response.json({});
-    // One lookup over the feed's guids, then two retry ranges and nothing more.
-    await tick(env, NOW + 3600_000, { queriesLeft: 1 + 2 * QUERIES_PER_CLAIM });
+    // The feed lookup and the failed-range scan, then two retry ranges and nothing more.
+    await tick(env, NOW + 3600_000, { queriesLeft: 2 + 2 * QUERIES_PER_CLAIM });
     expect(issueCalls()).toHaveLength(3); // still no new calls
     const done = await env.DB.prepare("SELECT COUNT(*) AS n FROM batches WHERE status = 'sent'").first<{ n: number }>();
     expect(done?.n).toBe(2);
@@ -408,8 +409,8 @@ describe("tick", () => {
     await addSubscribers(1, "a");
     await publishNewPost();
 
-    // Exactly one range's worth. Ingest takes two of them — the guid lookup and the insert —
-    // leaving too little to claim a range; budgeted separately, this would have sent.
+    // Exactly one range's worth. Ingest takes two of them — the guid lookup and the insert — and
+    // the failed-range scan a third, leaving too little to claim; budgeted separately it would send.
     await tick(env, NOW, { queriesLeft: QUERIES_PER_SEND });
     expect(issueCalls()).toHaveLength(0);
 
