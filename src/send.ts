@@ -12,6 +12,7 @@ export interface Env {
   MAILGUN_API_KEY: string;
   MAILGUN_API_BASE?: string;
   TURNSTILE_SECRET: string;
+  SENTRY_DSN?: string; // absent in tests and local dev: the SDK goes inert
 }
 
 export const STALE_MS = 7 * 24 * 60 * 60 * 1000;
@@ -131,7 +132,7 @@ async function sendIssue(env: Env, issue: Issue, now: number) {
       .prepare("SELECT id, email, token FROM subscribers WHERE status = 'active' AND id > ? AND id <= ? ORDER BY id")
       .bind(b.after_id, b.last_id)
       .all<Recipient>();
-    await deliver(env, issue, b.id, results, now);
+    await deliver(env, issue, b.id, results);
   }
 
   for (;;) {
@@ -166,14 +167,13 @@ async function sendIssue(env: Env, issue: Issue, now: number) {
     ]);
     const claimed = ins.results[0] as { id: number } | undefined;
     if (!claimed) return;
-    await deliver(env, issue, claimed.id, results, now);
+    await deliver(env, issue, claimed.id, results);
   }
 }
 
 /** Sends one claimed batch. Leaves it in_flight when the outcome is unknown. */
-async function deliver(env: Env, issue: Issue, batchId: number, recipients: Recipient[], now: number) {
+async function deliver(env: Env, issue: Issue, batchId: number, recipients: Recipient[]) {
   let status = "sent"; // an empty retry range (everyone unsubscribed) is trivially sent
-  let failure = "";
   if (recipients.length) {
     let res: Response;
     try {
@@ -184,43 +184,17 @@ async function deliver(env: Env, issue: Issue, batchId: number, recipients: Reci
       return;
     }
     if (!res.ok) {
-      // A proxy in front of Mailgun can answer with a whole HTML page; this lands in an email.
-      failure = `HTTP ${res.status}: ${(await res.text()).slice(0, 500)}`;
-      console.error(`batch ${batchId}: Mailgun refused, will retry:`, failure); // body is remote text: keep it out of the format string
+      // This body reaches Sentry. Cap it (a proxy can answer with a whole HTML page) and drop
+      // addresses: Mailgun names the offending recipient on a 400, and subscriber emails are not
+      // ours to hand to a third party.
+      const body = (await res.text()).slice(0, 500).replace(/[^\s<>"']+@[^\s<>"']+/g, "<email>");
+      console.error(`batch ${batchId}: Mailgun HTTP ${res.status}, will retry:`, body); // body is remote text: keep it out of the format string
       status = "failed";
     }
   }
   await env.DB.prepare("UPDATE batches SET status = ? WHERE id = ? AND status = 'in_flight'")
     .bind(status, batchId)
     .run();
-  if (failure) await alertFailed(env, issue.guid, batchId, failure, now);
-}
-
-/**
- * One email per refused batch, however many ticks retry it.
- * The alert goes through Mailgun too, so a total Mailgun outage leaves only the console.error above.
- */
-async function alertFailed(env: Env, guid: string, batchId: number, failure: string, now: number) {
-  const alerted = await env.DB.prepare("SELECT failed_alerted_at FROM batches WHERE id = ?")
-    .bind(batchId)
-    .first<number | null>("failed_alerted_at");
-  if (alerted) return;
-  const sent = await alertAdmin(
-    env,
-    `Batch ${batchId} refused by Mailgun`,
-    `Batch ${batchId} of ${guid} was refused by Mailgun:
-
-${failure}
-
-Every tick retries it until Mailgun accepts, so no issue is lost, but nothing ships until this clears.
-Usual causes: a revoked MAILGUN_API_KEY, an unverified sending domain, or a plan limit.
-`,
-  );
-  if (sent) {
-    await env.DB.prepare("UPDATE batches SET failed_alerted_at = ? WHERE id = ?").bind(now, batchId).run();
-  } else {
-    console.error(`batch ${batchId} refused; alert not sent, will retry next tick`);
-  }
 }
 
 function batchForm(env: Env, issue: Issue, batchId: number, recipients: Recipient[]): FormData {
@@ -271,9 +245,12 @@ async function alertFlagged(env: Env, now: number) {
   for (const b of results) {
     const sql = (status: string) =>
       `npx wrangler d1 execute DB --remote --command "UPDATE batches SET status = '${status}' WHERE id = ${b.id} AND status = 'flagged'"`;
-    const sent = await alertAdmin(
-      env,
-      `Batch ${b.id} needs a decision`,
+    const form = new FormData();
+    form.set("from", env.FROM);
+    form.set("to", env.ADMIN_EMAIL);
+    form.set("subject", `[${env.SITE_NAME}] Batch ${b.id} needs a decision`);
+    form.set(
+      "text",
       `Batch ${b.id} of ${b.guid} was handed to Mailgun at ${new Date(b.started_at).toISOString()} and never confirmed.
 It may or may not have been delivered, so it will not be retried automatically.
 
@@ -288,21 +265,11 @@ If it did not (the next tick resends it):
 Or run the resolve-flagged-batch skill in this repo with Claude Code.
 `,
     );
-    if (sent) {
+    const res = await mailgun(env, form).catch((e) => (console.error("alert send failed", e), null));
+    if (res?.ok) {
       await env.DB.prepare("UPDATE batches SET alerted_at = ? WHERE id = ?").bind(now, b.id).run();
     } else {
       console.error(`batch ${b.id} flagged; alert not sent, will retry next tick`);
     }
   }
-}
-
-/** Emails ADMIN_EMAIL. Returns whether Mailgun accepted it. */
-async function alertAdmin(env: Env, subject: string, text: string): Promise<boolean> {
-  const form = new FormData();
-  form.set("from", env.FROM);
-  form.set("to", env.ADMIN_EMAIL);
-  form.set("subject", `[${env.SITE_NAME}] ${subject}`);
-  form.set("text", text);
-  const res = await mailgun(env, form).catch((e) => (console.error("alert send failed", e), null));
-  return !!res?.ok;
 }

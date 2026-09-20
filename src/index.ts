@@ -1,6 +1,11 @@
+import * as Sentry from "@sentry/cloudflare";
 import { type Env, esc, mailgun, tick } from "./send";
 
-export default {
+// Every console.error in this Worker becomes a Sentry event. That's the point: Mailgun failures
+// can't be reported by email (the same credentials send both), and a cron run that swallows a
+// phase failure looks healthy. Sentry groups by message, so each batch alerts once.
+// No DSN (tests, local dev) makes the SDK inert.
+const handler = {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
     const token = url.searchParams.get("t") ?? "";
@@ -20,10 +25,19 @@ export default {
     return new Response("Not found", { status: 404 });
   },
 
-  async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+  // _ctx is unused here but must stay in the signature: Sentry flushes via ctx.waitUntil.
+  async scheduled(_controller: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
     await tick(env);
   },
 } satisfies ExportedHandler<Env>;
+
+export default Sentry.withSentry(
+  (env: Env) => ({
+    dsn: env.SENTRY_DSN,
+    integrations: [Sentry.captureConsoleIntegration({ levels: ["error"] })],
+  }),
+  handler,
+);
 
 async function subscribe(req: Request, env: Env): Promise<Response> {
   const form = await req.formData();

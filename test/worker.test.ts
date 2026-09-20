@@ -1,4 +1,4 @@
-import { env } from "cloudflare:test";
+import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index";
 import { FLAG_AFTER_MS, parseFeed, STALE_MS, tick } from "../src/send";
@@ -122,39 +122,6 @@ describe("tick", () => {
     expect(issueCalls()).toHaveLength(4);
   });
 
-  it("alerts once about a refused batch, however many ticks retry it", async () => {
-    await addSubscribers(1, "a");
-    await publishNewPost();
-    // A proxy can answer with a whole HTML page instead of Mailgun's JSON.
-    mailgunReply = (f) => (f.has("v:batch") ? new Response(`bad key ${"x".repeat(5000)}`, { status: 401 }) : Response.json({}));
-    await tick(env, NOW);
-    await tick(env, NOW + 3600_000);
-    expect(issueCalls()).toHaveLength(2); // still retrying
-    expect(alertCalls()).toHaveLength(1);
-    expect(alertCalls()[0].get("text")).toContain("HTTP 401: bad key");
-    expect(String(alertCalls()[0].get("text")).length).toBeLessThan(1000); // body truncated
-    expect(await env.DB.prepare("SELECT failed_alerted_at FROM batches").first("failed_alerted_at")).toBe(NOW);
-
-    await tick(env, NOW + 7200_000);
-    expect(alertCalls()).toHaveLength(1);
-  });
-
-  it("retries the refused-batch alert until it sends", async () => {
-    await addSubscribers(1, "a");
-    await publishNewPost();
-    mailgunReply = (f) =>
-      f.has("v:batch")
-        ? new Response("bad key", { status: 401 })
-        : alertCalls().length === 1
-          ? new Response("no", { status: 500 }) // the first alert doesn't get through
-          : Response.json({});
-    await tick(env, NOW);
-    expect(alertCalls()).toHaveLength(1);
-    await tick(env, NOW + 3600_000);
-    await tick(env, NOW + 7200_000);
-    expect(alertCalls()).toHaveLength(2);
-  });
-
   it("flags a batch with unknown outcome, alerts once, and never resends it on its own", async () => {
     await addSubscribers(3, "a");
     await publishNewPost();
@@ -266,6 +233,27 @@ describe("tick", () => {
     mailgunReply = () => Response.json({});
     await expect(tick(env, NOW + 3600_000)).rejects.toThrow(AggregateError);
     expect(issueCalls()).toHaveLength(2);
+  });
+
+  it("keeps subscriber addresses out of the logged Mailgun error", async () => {
+    await addSubscribers(1, "a");
+    await publishNewPost();
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    mailgunReply = () => new Response("a1@x.test is not a valid address", { status: 400 });
+    await tick(env, NOW);
+    const logged = err.mock.calls.flat().join(" ");
+    expect(logged).toContain("<email> is not a valid address");
+    expect(logged).not.toContain("a1@x.test");
+  });
+
+  // Sentry reports a failed run by catching what the handler throws, so the wrapper must rethrow:
+  // swallow it and Cloudflare marks a broken tick successful.
+  it("still fails the scheduled run through the Sentry wrapper", async () => {
+    feedXml = null;
+    const ctx = createExecutionContext();
+    const controller = { scheduledTime: NOW, cron: "0 * * * *", noRetry: () => {} } satisfies ScheduledController;
+    await expect(worker.scheduled?.(controller, env, ctx)).rejects.toThrow(AggregateError);
+    await waitOnExecutionContext(ctx);
   });
 
   it("sends each recipient once when ticks overlap", async () => {
