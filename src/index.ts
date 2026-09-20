@@ -74,7 +74,11 @@ async function confirm(env: Env, token: string): Promise<Response> {
 }
 
 async function unsubscribe(req: Request, env: Env, token: string): Promise<Response> {
-  const { meta } = await env.DB.prepare("UPDATE subscribers SET status = 'unsubscribed' WHERE token = ?").bind(token).run();
+  const { meta } = await env.DB.prepare(
+    "UPDATE subscribers SET status = 'unsubscribed', unsubscribed_at = ?, unsubscribe_reason = 'self' WHERE token = ?",
+  )
+    .bind(Date.now(), token)
+    .run();
   const form = await req.formData().catch(() => null);
   // RFC 8058 one-click: a mail provider posting on the reader's behalf, nobody to show a page to.
   if (form?.get("List-Unsubscribe") === "One-Click") return new Response(null, { status: meta.changes ? 200 : 404 });

@@ -27,6 +27,8 @@ export const MAX_BATCH_SIZE = 1000;
 // the budget is gone and the next one resumes from the cursor; without this, every row still
 // in flight when the Worker is killed would be flagged.
 export const SEND_BUDGET_MS = 10 * 60 * 1000;
+export const SUPPRESSION_PAGE_SIZE = 1000; // Mailgun's maximum for these lists
+export const SUPPRESSION_PAGES = 5;
 // A provider that is refusing everything would otherwise log once per recipient. Counted per send
 // loop, not per tick: a streak on one issue says nothing about the next one, and sharing the count
 // would let a few permanently bad addresses block every issue published afterwards.
@@ -75,6 +77,12 @@ export interface FeedItem {
 
 type Issue = Omit<FeedItem, "pubDate">;
 
+/** An address the provider will not deliver to, and why. */
+export interface Suppression {
+  email: string;
+  reason: "bounce" | "complaint";
+}
+
 interface Recipient {
   id: number;
   email: string;
@@ -120,6 +128,9 @@ export async function tick(env: Env, now = Date.now(), budget: Partial<Run> = {}
     await alertFlagged(env, now);
   });
   await attempt("feed ingest", () => ingestFeed(env, now));
+  await attempt("suppressions", async () => {
+    await suppress(env, await fetchSuppressions(env), now);
+  });
 
   const { results } = await env.DB.prepare(
     `SELECT guid, title, link, html FROM items
@@ -288,13 +299,57 @@ function batchForm(env: Env, issue: Issue, batchId: number, recipients: Recipien
   return form;
 }
 
+function mailgunBase(env: Env): string {
+  return `${env.MAILGUN_API_BASE || "https://api.mailgun.net"}/v3/${env.MAILGUN_DOMAIN}`;
+}
+
+function mailgunAuth(env: Env): HeadersInit {
+  return { Authorization: `Basic ${btoa(`api:${env.MAILGUN_API_KEY}`)}` };
+}
+
 export function mailgun(env: Env, form: FormData): Promise<Response> {
-  const base = env.MAILGUN_API_BASE || "https://api.mailgun.net";
-  return fetch(`${base}/v3/${env.MAILGUN_DOMAIN}/messages`, {
-    method: "POST",
-    headers: { Authorization: `Basic ${btoa(`api:${env.MAILGUN_API_KEY}`)}` },
-    body: form,
-  });
+  return fetch(`${mailgunBase(env)}/messages`, { method: "POST", headers: mailgunAuth(env), body: form });
+}
+
+/**
+ * Mailgun's bounce and complaint lists, which are the authoritative record of who it will not
+ * deliver to. It already drops messages to these addresses on its own, so this exists to keep our
+ * table honest — stop spending a send on a dead address, and keep our own record of who complained.
+ *
+ * The lists carry no timestamp filter, so each tick walks them whole. That costs one request per
+ * 1,000 entries, which is a handful of requests for years.
+ * ponytail: full walk each tick; switch to the events API with a stored cursor if it outgrows
+ * SUPPRESSION_PAGES, which would silently start truncating the list.
+ */
+export async function fetchSuppressions(env: Env): Promise<Suppression[]> {
+  const found: Suppression[] = [];
+  // Mailgun's unsubscribes list is deliberately not read: this Worker uses its own tokenized
+  // unsubscribe links, not Mailgun's tracking, so that list should stay empty.
+  for (const [list, reason] of [
+    ["bounces", "bounce"],
+    ["complaints", "complaint"],
+  ] as const) {
+    let url = `${mailgunBase(env)}/${list}?limit=${SUPPRESSION_PAGE_SIZE}`;
+    for (let page = 0; page < SUPPRESSION_PAGES; page++) {
+      const res = await fetch(url, { headers: mailgunAuth(env) }).catch((e) => {
+        console.error(`could not read Mailgun ${list}:`, e);
+        return null;
+      });
+      if (!res) break;
+      if (!res.ok) {
+        console.error(`could not read Mailgun ${list}: HTTP ${res.status}`);
+        break;
+      }
+      const body = (await res.json().catch(() => null)) as { items?: { address?: string }[]; paging?: { next?: string } } | null;
+      const items = body?.items ?? [];
+      for (const i of items) if (i.address) found.push({ email: i.address, reason });
+      // paging.next is returned even at the end of the list, so a short page is the only real stop.
+      if (items.length < SUPPRESSION_PAGE_SIZE || !body?.paging?.next) break;
+      url = body.paging.next;
+      if (page === SUPPRESSION_PAGES - 1) console.error(`Mailgun ${list} is longer than ${SUPPRESSION_PAGES} pages; the rest was not read`);
+    }
+  }
+  return found;
 }
 
 export function esc(s: string): string {
@@ -313,6 +368,27 @@ ${issue.html}
 <a href="${esc(env.SITE_URL)}" style="color:#666">${esc(env.SITE_NAME)}</a>.
 <a href="${unsubscribe}" style="color:#666">Unsubscribe</a>.</p>
 </div></body></html>`;
+}
+
+/**
+ * Stops sending to addresses the provider has suppressed, recording which of the two it was.
+ * Only 'active' rows are touched: someone who already left stays left, with their original reason.
+ * Returns how many subscribers this changed.
+ */
+export async function suppress(env: Env, entries: Suppression[], now: number): Promise<number> {
+  if (!entries.length) return 0;
+  const rows = await env.DB.batch(
+    entries.map((e) =>
+      env.DB.prepare(
+        `UPDATE subscribers SET status = 'unsubscribed', unsubscribed_at = ?, unsubscribe_reason = ?
+         WHERE email = ? AND status = 'active'`,
+      ).bind(now, e.reason, e.email.toLowerCase()),
+    ),
+  );
+  const changed = rows.reduce((n, r) => n + (r.meta.changes ?? 0), 0);
+  // Worth a line even though it is routine: a complaint is a person saying they did not want this.
+  if (changed) console.error(`suppressed ${changed} subscriber(s):`, entries.map((e) => e.reason).join(","));
+  return changed;
 }
 
 async function alertFlagged(env: Env, now: number) {

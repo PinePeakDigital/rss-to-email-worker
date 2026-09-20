@@ -41,6 +41,10 @@ _Avoid_: Send, campaign, newsletter (for a single send)
 **Batch**:
 One provider call delivering an issue to a claimed range of subscribers. `BATCH_SIZE` sets how many, and defaults to 1 — so a batch is normally one recipient, and the range holds one ID.
 
+**Suppressed**:
+An address the provider will not deliver to, because it bounced or the recipient reported spam. Mirrored into `subscribers` as `status = 'unsubscribed'` with an `unsubscribe_reason` of `bounce` or `complaint`.
+_Avoid_: Blocked, banned. The provider enforces this, not us.
+
 **Flagged batch**:
 A batch whose outcome is unknown (the provider may or may not have accepted it); it is never retried automatically and awaits a person.
 _Avoid_: Failed batch (a failed batch is known not to have been accepted, and is retried)
