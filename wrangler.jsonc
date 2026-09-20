@@ -5,6 +5,8 @@
   "name": "rss-to-email",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-15",
+  // @sentry/cloudflare needs AsyncLocalStorage.
+  "compatibility_flags": ["nodejs_compat"],
   "triggers": { "crons": ["0 * * * *"] },
   // console.error from tick/send is the only record of Mailgun failures: keep logs on.
   "observability": { "enabled": true, "logs": { "enabled": true } },
@@ -27,6 +29,8 @@
     "ADMIN_EMAIL": "you@example.com",
     "MAILGUN_DOMAIN": "mail.example.com",
     // EU-region Mailgun accounts: https://api.eu.mailgun.net
-    "MAILGUN_API_BASE": "https://api.mailgun.net"
+    "MAILGUN_API_BASE": "https://api.mailgun.net",
+    // Not a secret: a DSN only permits submitting events. Empty disables Sentry.
+    "SENTRY_DSN": ""
   }
 }

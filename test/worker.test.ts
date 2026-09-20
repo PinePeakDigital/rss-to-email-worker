@@ -1,4 +1,4 @@
-import { env } from "cloudflare:test";
+import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index";
 import { FLAG_AFTER_MS, parseFeed, STALE_MS, tick } from "../src/send";
@@ -233,6 +233,27 @@ describe("tick", () => {
     mailgunReply = () => Response.json({});
     await expect(tick(env, NOW + 3600_000)).rejects.toThrow(AggregateError);
     expect(issueCalls()).toHaveLength(2);
+  });
+
+  it("keeps subscriber addresses out of the logged Mailgun error", async () => {
+    await addSubscribers(1, "a");
+    await publishNewPost();
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    mailgunReply = () => new Response("a1@x.test is not a valid address", { status: 400 });
+    await tick(env, NOW);
+    const logged = err.mock.calls.flat().join(" ");
+    expect(logged).toContain("<email> is not a valid address");
+    expect(logged).not.toContain("a1@x.test");
+  });
+
+  // Sentry reports a failed run by catching what the handler throws, so the wrapper must rethrow:
+  // swallow it and Cloudflare marks a broken tick successful.
+  it("still fails the scheduled run through the Sentry wrapper", async () => {
+    feedXml = null;
+    const ctx = createExecutionContext();
+    const controller = { scheduledTime: NOW, cron: "0 * * * *", noRetry: () => {} } satisfies ScheduledController;
+    await expect(worker.scheduled?.(controller, env, ctx)).rejects.toThrow(AggregateError);
+    await waitOnExecutionContext(ctx);
   });
 
   it("sends each recipient once when ticks overlap", async () => {

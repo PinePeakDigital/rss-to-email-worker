@@ -12,6 +12,7 @@ export interface Env {
   MAILGUN_API_KEY: string;
   MAILGUN_API_BASE?: string;
   TURNSTILE_SECRET: string;
+  SENTRY_DSN?: string; // absent in tests and local dev: the SDK goes inert
 }
 
 export const STALE_MS = 7 * 24 * 60 * 60 * 1000;
@@ -183,7 +184,11 @@ async function deliver(env: Env, issue: Issue, batchId: number, recipients: Reci
       return;
     }
     if (!res.ok) {
-      console.error(`batch ${batchId}: Mailgun HTTP ${res.status}, will retry: ${await res.text()}`);
+      // This body reaches Sentry. Cap it (a proxy can answer with a whole HTML page) and drop
+      // addresses: Mailgun names the offending recipient on a 400, and subscriber emails are not
+      // ours to hand to a third party.
+      const body = (await res.text()).slice(0, 500).replace(/[^\s<>"']+@[^\s<>"']+/g, "<email>");
+      console.error(`batch ${batchId}: Mailgun HTTP ${res.status}, will retry:`, body); // body is remote text: keep it out of the format string
       status = "failed";
     }
   }

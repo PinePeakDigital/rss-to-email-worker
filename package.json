@@ -19,6 +19,7 @@
   },
   "homepage": "https://github.com/PinePeakDigital/rss-to-email-worker#readme",
   "dependencies": {
+    "@sentry/cloudflare": "^10.75.0",
     "fast-xml-parser": "^5.11.1"
   },
   "devDependencies": {
