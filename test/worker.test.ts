@@ -351,6 +351,23 @@ describe("tick", () => {
     expect(new Set(recipients()).size).toBe(8);
   });
 
+  it("charges the budget for a retry range even when everyone in it has left", async () => {
+    await addSubscribers(3, "a");
+    await publishNewPost();
+    mailgunReply = () => new Response("boom", { status: 500 });
+    await tick(env, NOW, { sendsLeft: 3 }); // 3 sends, all refused -> 3 'failed' rows
+    expect(issueCalls()).toHaveLength(3);
+
+    // Nobody is left in any range, so these retries make no provider call at all. They still cost
+    // the D1 queries that claiming them spent, so the budget must stop after two of the three.
+    await env.DB.prepare("UPDATE subscribers SET status = 'unsubscribed'").run();
+    mailgunReply = () => Response.json({});
+    await tick(env, NOW + 3600_000, { sendsLeft: 2 });
+    expect(issueCalls()).toHaveLength(3); // still no new calls
+    const done = await env.DB.prepare("SELECT COUNT(*) AS n FROM batches WHERE status = 'sent'").first<{ n: number }>();
+    expect(done?.n).toBe(2);
+  });
+
   it("keeps going when failures are not consecutive", async () => {
     await addSubscribers(20, "a");
     await publishNewPost();

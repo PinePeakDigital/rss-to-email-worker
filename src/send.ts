@@ -31,10 +31,13 @@ export const SEND_BUDGET_MS = 10 * 60 * 1000;
 // loop, not per tick: a streak on one issue says nothing about the next one, and sharing the count
 // would let a few permanently bad addresses block every issue published afterwards.
 export const MAX_CONSECUTIVE_FAILURES = 5;
-// Each send costs about five subrequests (two selects, a two-statement batch, the provider call and
-// the status update) against Cloudflare's per-invocation ceiling of 10,000. Exceeding it throws
-// mid-send and strands a claimed range; stopping short of it defers cleanly to the next tick.
-export const MAX_SENDS_PER_TICK = 1500;
+// D1 allows 1,000 queries per Worker invocation, and every statement in a batch() counts as one.
+// Claiming and sending one range costs five (two selects, a two-statement batch, the status update),
+// so the ceiling is near 200 — well below Cloudflare's 10,000 subrequests, which is not the binding
+// limit here. Exceeding D1's throws mid-send and strands a claimed range; stopping short defers
+// cleanly to the next tick. The rest of the budget covers flagging, alerts and feed ingest, whose
+// cost grows with the number of items in the feed.
+export const MAX_SENDS_PER_TICK = 150;
 
 /** What a tick has left to spend. Mutated as it proceeds. */
 interface Run {
@@ -241,8 +244,10 @@ async function sendIssue(env: Env, issue: Issue, now: number, run: Run) {
 async function deliver(env: Env, issue: Issue, batchId: number, recipients: Recipient[], run: Run): Promise<boolean | null> {
   let status = "sent"; // an empty retry range (everyone unsubscribed) is trivially sent
   let sent: boolean | null = null;
+  // Charged even when there is nobody left to send to: claiming the range already cost the queries,
+  // and a backlog of emptied ranges would otherwise spin without ever exhausting the budget.
+  run.sendsLeft--;
   if (recipients.length) {
-    run.sendsLeft--;
     let res: Response;
     try {
       res = await mailgun(env, batchForm(env, issue, batchId, recipients));
