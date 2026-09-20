@@ -38,6 +38,14 @@ The recorded moment and source of a subscriber's confirmation; rewritten each ti
 The sending of one item to the subscriber list.
 _Avoid_: Send, campaign, newsletter (for a single send)
 
+**Tick**:
+One cron run. Holds a budget — a wall-clock deadline and a share of D1's per-invocation query limit — that every phase draws from and none may exceed; work that doesn't fit waits for the next tick.
+_Avoid_: Run, cycle, job
+
+**Claim**:
+A range of subscriber IDs a tick has taken for an issue, recorded as an in-flight batch and owed a delivery. Claims come from two places: ranges a previous tick had refused, and the next range past the issue's cursor.
+_Avoid_: Chunk, slice, lease
+
 **Batch**:
 One provider call delivering an issue to a claimed range of subscribers. `BATCH_SIZE` sets how many, and defaults to 1 — so a batch is normally one recipient, and the range holds one ID.
 
