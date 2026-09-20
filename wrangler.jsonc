@@ -27,6 +27,10 @@
     "ADMIN_EMAIL": "you@example.com",
     "MAILGUN_DOMAIN": "mail.example.com",
     // EU-region Mailgun accounts: https://api.eu.mailgun.net
-    "MAILGUN_API_BASE": "https://api.mailgun.net"
+    "MAILGUN_API_BASE": "https://api.mailgun.net",
+    // Recipients per Mailgun call. Mailgun 403s large batches from a new sending domain and gives
+    // no way to ask when that lifts, so 1 is the size that always works; raise it (max 1000) by
+    // testing upward. At 1, a tick delivers 150 messages, so a few hundred subscribers take hours.
+    "BATCH_SIZE": 1
   }
 }

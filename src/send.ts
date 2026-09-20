@@ -12,12 +12,58 @@ export interface Env {
   MAILGUN_API_KEY: string;
   MAILGUN_API_BASE?: string;
   TURNSTILE_SECRET: string;
+  BATCH_SIZE?: string | number; // recipients per provider call; see batchSize()
 }
 
 export const STALE_MS = 7 * 24 * 60 * 60 * 1000;
 // A batch still in flight after this is presumed dead mid-send and flagged.
 export const FLAG_AFTER_MS = 15 * 60 * 1000;
-export const BATCH_SIZE = 1000; // Mailgun's per-call recipient limit
+// One recipient per call by default: Mailgun 403s a large batch from a new sending domain
+// ("is not allowed to send large batches yet") and the refusal is easy to miss. Raise BATCH_SIZE
+// (up to 1000, Mailgun's per-batch limit) once it is allowed — see docs/adr/0002.
+export const DEFAULT_BATCH_SIZE = 1;
+export const MAX_BATCH_SIZE = 1000;
+// Sending is sequential, so a long list can outrun the cron wall-clock limit. A tick stops when
+// the budget is gone and the next one resumes from the cursor; without this, every row still
+// in flight when the Worker is killed would be flagged.
+export const SEND_BUDGET_MS = 10 * 60 * 1000;
+// A provider that is refusing everything would otherwise log once per recipient. Counted per send
+// loop, not per tick: a streak on one issue says nothing about the next one, and sharing the count
+// would let a few permanently bad addresses block every issue published afterwards.
+export const MAX_CONSECUTIVE_FAILURES = 5;
+// D1 allows 1,000 queries per Worker invocation, and every statement in a batch() counts as one.
+// Claiming and sending one range costs five (two selects, a two-statement batch, the status update),
+// so the ceiling is near 200 — well below Cloudflare's 10,000 subrequests, which is not the binding
+// limit here. Exceeding D1's throws mid-send and strands a claimed range; stopping short defers
+// cleanly to the next tick. The rest of the budget covers flagging, alerts and feed ingest, whose
+// cost grows with the number of items in the feed.
+export const MAX_SENDS_PER_TICK = 150;
+
+/** What a tick has left to spend. Mutated as it proceeds. */
+interface Run {
+  deadline: number;
+  sendsLeft: number;
+}
+
+/** Folds a send's outcome into a refusal streak. A send that made no call is neither. */
+function streak(refusals: number, sent: boolean | null): number {
+  return sent === null ? refusals : sent ? 0 : refusals + 1;
+}
+
+/** Says why a send loop stopped, when it stopped because the provider kept refusing. */
+function giveUp(refusals: number, what: string): void {
+  if (refusals >= MAX_CONSECUTIVE_FAILURES) console.error(`gave up ${what}: ${refusals} sends refused in a row`);
+}
+
+/** Whether the tick is out of budget. Refusal streaks are tracked per send loop, not here. */
+function outOfBudget(run: Run): boolean {
+  return run.sendsLeft <= 0 || Date.now() > run.deadline;
+}
+
+export function batchSize(env: Env): number {
+  const n = Number(env.BATCH_SIZE ?? DEFAULT_BATCH_SIZE);
+  return Number.isInteger(n) && n >= 1 && n <= MAX_BATCH_SIZE ? n : DEFAULT_BATCH_SIZE;
+}
 
 export interface FeedItem {
   guid: string;
@@ -56,8 +102,11 @@ export function parseFeed(xml: string): FeedItem[] {
  * Each phase is isolated so one failure (say, a D1 hiccup on one issue) can't starve the rest;
  * failures are rethrown together at the end so the cron run still shows as failed.
  */
-export async function tick(env: Env, now = Date.now()): Promise<void> {
+export async function tick(env: Env, now = Date.now(), budget: Partial<Run> = {}): Promise<void> {
   const errors: unknown[] = [];
+  // Shared across every issue in this tick, so a provider that is down is reported once, not once
+  // per recipient, and the wall-clock budget covers the whole run rather than each issue.
+  const run: Run = { deadline: Date.now() + SEND_BUDGET_MS, sendsLeft: MAX_SENDS_PER_TICK, ...budget };
   const attempt = (what: string, fn: () => Promise<void>) =>
     fn().catch((e) => {
       console.error("tick phase failed; continuing:", what, e); // what may hold a feed guid: keep it out of the format string
@@ -78,7 +127,15 @@ export async function tick(env: Env, now = Date.now()): Promise<void> {
        AND (done_at IS NULL OR guid IN (SELECT guid FROM batches WHERE status = 'failed'))
      ORDER BY pub_date, guid`,
   ).all<Issue>();
-  for (const issue of results) await attempt(`issue ${issue.guid}`, () => sendIssue(env, issue, now));
+  for (const issue of results) {
+    if (outOfBudget(run)) break;
+    await attempt(`issue ${issue.guid}`, () => sendIssue(env, issue, now, run));
+  }
+  if (outOfBudget(run)) {
+    console.error(
+      `tick out of ${run.sendsLeft <= 0 ? "sends" : "time"} with issues left to send; the next tick resumes`,
+    );
+  }
 
   if (errors.length) throw new AggregateError(errors, `${errors.length} tick phase(s) failed`);
 }
@@ -114,14 +171,21 @@ async function ingestFeed(env: Env, now: number) {
   );
 }
 
-async function sendIssue(env: Env, issue: Issue, now: number) {
+async function sendIssue(env: Env, issue: Issue, now: number, run: Run) {
   const db = env.DB;
 
   const failed = await db
     .prepare("SELECT id, after_id, last_id FROM batches WHERE guid = ? AND status = 'failed'")
     .bind(issue.guid)
     .all<{ id: number; after_id: number; last_id: number }>();
+  let refusals = 0; // this loop's streak only
   for (const b of failed.results) {
+    if (outOfBudget(run)) return;
+    if (refusals >= MAX_CONSECUTIVE_FAILURES) {
+      // Addresses that always fail would otherwise stop this issue reaching anyone new.
+      giveUp(refusals, `retrying ${issue.guid}`);
+      break;
+    }
     const claim = await db
       .prepare("UPDATE batches SET status = 'in_flight', started_at = ? WHERE id = ? AND status = 'failed'")
       .bind(now, b.id)
@@ -131,10 +195,13 @@ async function sendIssue(env: Env, issue: Issue, now: number) {
       .prepare("SELECT id, email, token FROM subscribers WHERE status = 'active' AND id > ? AND id <= ? ORDER BY id")
       .bind(b.after_id, b.last_id)
       .all<Recipient>();
-    await deliver(env, issue, b.id, results);
+    refusals = streak(refusals, await deliver(env, issue, b.id, results, run));
   }
 
+  refusals = 0;
   for (;;) {
+    if (outOfBudget(run)) return;
+    if (refusals >= MAX_CONSECUTIVE_FAILURES) return giveUp(refusals, `sending ${issue.guid}`);
     const row = await db.prepare("SELECT cursor, done_at FROM items WHERE guid = ?").bind(issue.guid).first<{
       cursor: number;
       done_at: number | null;
@@ -143,7 +210,7 @@ async function sendIssue(env: Env, issue: Issue, now: number) {
     if (row.done_at) return;
     const { results } = await db
       .prepare("SELECT id, email, token FROM subscribers WHERE status = 'active' AND id > ? ORDER BY id LIMIT ?")
-      .bind(row.cursor, BATCH_SIZE)
+      .bind(row.cursor, batchSize(env))
       .all<Recipient>();
     if (!results.length) {
       // The cursor check keeps a concurrent tick's fresh claim from being closed over.
@@ -166,13 +233,20 @@ async function sendIssue(env: Env, issue: Issue, now: number) {
     ]);
     const claimed = ins.results[0] as { id: number } | undefined;
     if (!claimed) return;
-    await deliver(env, issue, claimed.id, results);
+    refusals = streak(refusals, await deliver(env, issue, claimed.id, results, run));
   }
 }
 
-/** Sends one claimed batch. Leaves it in_flight when the outcome is unknown. */
-async function deliver(env: Env, issue: Issue, batchId: number, recipients: Recipient[]) {
+/**
+ * Sends one claimed batch. Leaves it in_flight when the outcome is unknown.
+ * Returns whether the provider accepted it, or null when there was nothing to send.
+ */
+async function deliver(env: Env, issue: Issue, batchId: number, recipients: Recipient[], run: Run): Promise<boolean | null> {
   let status = "sent"; // an empty retry range (everyone unsubscribed) is trivially sent
+  let sent: boolean | null = null;
+  // Charged even when there is nobody left to send to: claiming the range already cost the queries,
+  // and a backlog of emptied ranges would otherwise spin without ever exhausting the budget.
+  run.sendsLeft--;
   if (recipients.length) {
     let res: Response;
     try {
@@ -180,8 +254,9 @@ async function deliver(env: Env, issue: Issue, batchId: number, recipients: Reci
     } catch (e) {
       // The request may have reached Mailgun. Don't guess: stay in flight, get flagged.
       console.error(`batch ${batchId}: outcome unknown`, e);
-      return;
+      return false;
     }
+    sent = res.ok;
     if (!res.ok) {
       console.error(`batch ${batchId}: Mailgun HTTP ${res.status}, will retry: ${await res.text()}`);
       status = "failed";
@@ -190,16 +265,23 @@ async function deliver(env: Env, issue: Issue, batchId: number, recipients: Reci
   await env.DB.prepare("UPDATE batches SET status = ? WHERE id = ? AND status = 'in_flight'")
     .bind(status, batchId)
     .run();
+  return sent;
 }
 
 function batchForm(env: Env, issue: Issue, batchId: number, recipients: Recipient[]): FormData {
-  const unsubscribe = `${env.PUBLIC_URL}/unsubscribe?t=%recipient.token%`;
+  // A single recipient gets its real token and no recipient-variables. Mailgun refuses large
+  // batches from a new domain by recipient count, so this field isn't what trips it, but it is
+  // meaningless for one recipient and dropping it keeps the request plainly not a batch.
+  const single = recipients.length === 1 ? recipients[0] : null;
+  const unsubscribe = `${env.PUBLIC_URL}/unsubscribe?t=${single ? single.token : "%recipient.token%"}`;
   const form = new FormData();
   form.set("from", env.FROM);
   form.set("subject", issue.title);
   form.set("html", renderIssue(env, issue, unsubscribe));
   for (const r of recipients) form.append("to", r.email);
-  form.set("recipient-variables", JSON.stringify(Object.fromEntries(recipients.map((r) => [r.email, { token: r.token }]))));
+  if (!single) {
+    form.set("recipient-variables", JSON.stringify(Object.fromEntries(recipients.map((r) => [r.email, { token: r.token }]))));
+  }
   form.set("h:List-Unsubscribe", `<${unsubscribe}>`);
   form.set("h:List-Unsubscribe-Post", "List-Unsubscribe=One-Click");
   form.set("v:batch", String(batchId)); // searchable in Mailgun logs when resolving a flagged batch

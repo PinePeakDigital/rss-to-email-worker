@@ -39,7 +39,7 @@ The sending of one item to the subscriber list.
 _Avoid_: Send, campaign, newsletter (for a single send)
 
 **Batch**:
-One provider call delivering an issue to up to 1,000 subscribers.
+One provider call delivering an issue to a claimed range of subscribers. `BATCH_SIZE` sets how many, and defaults to 1 — so a batch is normally one recipient, and the range holds one ID.
 
 **Flagged batch**:
 A batch whose outcome is unknown (the provider may or may not have accepted it); it is never retried automatically and awaits a person.
