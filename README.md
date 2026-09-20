@@ -12,7 +12,7 @@ This is the part worth reading, and `test/worker.test.ts` covers it.
 
 - **An item is never considered twice.** Its GUID is recorded the first time it's seen. On the first run, everything already in the feed is recorded without sending. After that, items whose `pubDate` is more than 7 days old (backfills and most renames) are recorded without sending.
 - **Each issue sends in batches, claimed in order.** A batch covers a range of subscriber IDs above the issue's cursor — one ID at the default `BATCH_SIZE` of 1. A unique `(item, range start)` row plus a transaction means overlapping cron runs can't claim the same range. When no active subscriber is left above the cursor, the issue closes, so people who subscribe later don't receive old issues.
-- **A long list spreads over ticks.** Sending is sequential, so a tick stops after ten minutes and the next one resumes from the cursor, rather than being killed mid-issue by the cron wall-clock limit — which would leave every claimed range flagged. A tick also gives up after five refusals in a row, so a revoked key costs you five log lines instead of one per subscriber.
+- **A long list spreads over ticks.** Sending is sequential, so a tick stops after ten minutes and the next one resumes from the cursor, rather than being killed mid-issue by the cron wall-clock limit — which would leave every claimed range flagged. A tick also stops sending after five refusals in a row, per phase: a revoked key costs five log lines rather than one per subscriber. A dropped connection is worse — those sends have an unknown outcome, so five of them mean five flagged sends and five alert emails to resolve by hand. A tick sends at most 1,500 messages, which keeps it inside Cloudflare's per-invocation subrequest ceiling; above that an issue takes several ticks.
 - **Delivery is at most once.** If Mailgun returns an error, the batch is retried on the next tick. If the outcome is unknown (the Worker died or the connection dropped mid-request), the batch is **flagged**: it's never retried automatically, and you get one email with the exact command to resolve it. See [ADR 0001](docs/adr/0001-at-most-once-delivery.md). With Claude Code, the `resolve-flagged-batch` skill in `.claude/skills/` does the Mailgun log check for you.
 
 The domain vocabulary is defined in [CONTEXT.md](CONTEXT.md).
@@ -54,6 +54,8 @@ Imported subscribers are active, with consent source `substack-import` and their
 - If a post's GUID changes within 7 days of publishing (a renamed file, say), the post is sent again.
 - Scheduling is the feed's job. A future-dated item that's in the feed gets sent on the next tick.
 - Bounces and complaints are suppressed by Mailgun, but not mirrored into D1.
+- At the default `BATCH_SIZE` of 1, a tick delivers at most 1,500 messages, so a list larger than that takes more than an hour to receive an issue. Raise `BATCH_SIZE` well before the list makes that a problem.
+- An address Mailgun permanently rejects is retried every tick forever. Five such addresses on one issue consume that issue's whole retry phase each tick.
 
 ## Development
 

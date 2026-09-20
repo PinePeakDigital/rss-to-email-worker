@@ -27,18 +27,34 @@ export const MAX_BATCH_SIZE = 1000;
 // the budget is gone and the next one resumes from the cursor; without this, every row still
 // in flight when the Worker is killed would be flagged.
 export const SEND_BUDGET_MS = 10 * 60 * 1000;
-// A provider that is refusing everything would otherwise log once per recipient.
+// A provider that is refusing everything would otherwise log once per recipient. Counted per send
+// loop, not per tick: a streak on one issue says nothing about the next one, and sharing the count
+// would let a few permanently bad addresses block every issue published afterwards.
 export const MAX_CONSECUTIVE_FAILURES = 5;
+// Each send costs about five subrequests (two selects, a two-statement batch, the provider call and
+// the status update) against Cloudflare's per-invocation ceiling of 10,000. Exceeding it throws
+// mid-send and strands a claimed range; stopping short of it defers cleanly to the next tick.
+export const MAX_SENDS_PER_TICK = 1500;
 
-/** Per-tick send budget and failure streak. Mutated as the tick proceeds. */
+/** What a tick has left to spend. Mutated as it proceeds. */
 interface Run {
   deadline: number;
-  consecutiveFailures: number;
+  sendsLeft: number;
 }
 
-/** Whether this tick should stop sending: out of time, or the provider is refusing everything. */
-function spent(run: Run): boolean {
-  return Date.now() > run.deadline || run.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES;
+/** Folds a send's outcome into a refusal streak. A send that made no call is neither. */
+function streak(refusals: number, sent: boolean | null): number {
+  return sent === null ? refusals : sent ? 0 : refusals + 1;
+}
+
+/** Says why a send loop stopped, when it stopped because the provider kept refusing. */
+function giveUp(refusals: number, what: string): void {
+  if (refusals >= MAX_CONSECUTIVE_FAILURES) console.error(`gave up ${what}: ${refusals} sends refused in a row`);
+}
+
+/** Whether the tick is out of budget. Refusal streaks are tracked per send loop, not here. */
+function outOfBudget(run: Run): boolean {
+  return run.sendsLeft <= 0 || Date.now() > run.deadline;
 }
 
 export function batchSize(env: Env): number {
@@ -83,11 +99,11 @@ export function parseFeed(xml: string): FeedItem[] {
  * Each phase is isolated so one failure (say, a D1 hiccup on one issue) can't starve the rest;
  * failures are rethrown together at the end so the cron run still shows as failed.
  */
-export async function tick(env: Env, now = Date.now(), deadline = Date.now() + SEND_BUDGET_MS): Promise<void> {
+export async function tick(env: Env, now = Date.now(), budget: Partial<Run> = {}): Promise<void> {
   const errors: unknown[] = [];
   // Shared across every issue in this tick, so a provider that is down is reported once, not once
   // per recipient, and the wall-clock budget covers the whole run rather than each issue.
-  const run: Run = { deadline, consecutiveFailures: 0 };
+  const run: Run = { deadline: Date.now() + SEND_BUDGET_MS, sendsLeft: MAX_SENDS_PER_TICK, ...budget };
   const attempt = (what: string, fn: () => Promise<void>) =>
     fn().catch((e) => {
       console.error("tick phase failed; continuing:", what, e); // what may hold a feed guid: keep it out of the format string
@@ -109,12 +125,12 @@ export async function tick(env: Env, now = Date.now(), deadline = Date.now() + S
      ORDER BY pub_date, guid`,
   ).all<Issue>();
   for (const issue of results) {
-    if (spent(run)) break;
+    if (outOfBudget(run)) break;
     await attempt(`issue ${issue.guid}`, () => sendIssue(env, issue, now, run));
   }
-  if (spent(run)) {
+  if (outOfBudget(run)) {
     console.error(
-      `tick stopped early: ${run.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES ? `${run.consecutiveFailures} sends failed in a row` : "send budget spent"}; the next tick resumes`,
+      `tick out of ${run.sendsLeft <= 0 ? "sends" : "time"} with issues left to send; the next tick resumes`,
     );
   }
 
@@ -159,8 +175,14 @@ async function sendIssue(env: Env, issue: Issue, now: number, run: Run) {
     .prepare("SELECT id, after_id, last_id FROM batches WHERE guid = ? AND status = 'failed'")
     .bind(issue.guid)
     .all<{ id: number; after_id: number; last_id: number }>();
+  let refusals = 0; // this loop's streak only
   for (const b of failed.results) {
-    if (spent(run)) return;
+    if (outOfBudget(run)) return;
+    if (refusals >= MAX_CONSECUTIVE_FAILURES) {
+      // Addresses that always fail would otherwise stop this issue reaching anyone new.
+      giveUp(refusals, `retrying ${issue.guid}`);
+      break;
+    }
     const claim = await db
       .prepare("UPDATE batches SET status = 'in_flight', started_at = ? WHERE id = ? AND status = 'failed'")
       .bind(now, b.id)
@@ -170,11 +192,13 @@ async function sendIssue(env: Env, issue: Issue, now: number, run: Run) {
       .prepare("SELECT id, email, token FROM subscribers WHERE status = 'active' AND id > ? AND id <= ? ORDER BY id")
       .bind(b.after_id, b.last_id)
       .all<Recipient>();
-    await deliver(env, issue, b.id, results, run);
+    refusals = streak(refusals, await deliver(env, issue, b.id, results, run));
   }
 
+  refusals = 0;
   for (;;) {
-    if (spent(run)) return;
+    if (outOfBudget(run)) return;
+    if (refusals >= MAX_CONSECUTIVE_FAILURES) return giveUp(refusals, `sending ${issue.guid}`);
     const row = await db.prepare("SELECT cursor, done_at FROM items WHERE guid = ?").bind(issue.guid).first<{
       cursor: number;
       done_at: number | null;
@@ -206,40 +230,43 @@ async function sendIssue(env: Env, issue: Issue, now: number, run: Run) {
     ]);
     const claimed = ins.results[0] as { id: number } | undefined;
     if (!claimed) return;
-    await deliver(env, issue, claimed.id, results, run);
+    refusals = streak(refusals, await deliver(env, issue, claimed.id, results, run));
   }
 }
 
-/** Sends one claimed batch. Leaves it in_flight when the outcome is unknown. */
-async function deliver(env: Env, issue: Issue, batchId: number, recipients: Recipient[], run: Run) {
+/**
+ * Sends one claimed batch. Leaves it in_flight when the outcome is unknown.
+ * Returns whether the provider accepted it, or null when there was nothing to send.
+ */
+async function deliver(env: Env, issue: Issue, batchId: number, recipients: Recipient[], run: Run): Promise<boolean | null> {
   let status = "sent"; // an empty retry range (everyone unsubscribed) is trivially sent
+  let sent: boolean | null = null;
   if (recipients.length) {
+    run.sendsLeft--;
     let res: Response;
     try {
       res = await mailgun(env, batchForm(env, issue, batchId, recipients));
     } catch (e) {
       // The request may have reached Mailgun. Don't guess: stay in flight, get flagged.
-      run.consecutiveFailures++;
       console.error(`batch ${batchId}: outcome unknown`, e);
-      return;
+      return false;
     }
+    sent = res.ok;
     if (!res.ok) {
-      run.consecutiveFailures++;
-      // Only the first few of a run are logged; see MAX_CONSECUTIVE_FAILURES.
       console.error(`batch ${batchId}: Mailgun HTTP ${res.status}, will retry: ${await res.text()}`);
       status = "failed";
-    } else {
-      run.consecutiveFailures = 0;
     }
   }
   await env.DB.prepare("UPDATE batches SET status = ? WHERE id = ? AND status = 'in_flight'")
     .bind(status, batchId)
     .run();
+  return sent;
 }
 
 function batchForm(env: Env, issue: Issue, batchId: number, recipients: Recipient[]): FormData {
-  // A single recipient gets its real token and no recipient-variables: that field is what marks a
-  // message as a batch send, and the point of sending one at a time is to look like a plain message.
+  // A single recipient gets its real token and no recipient-variables. Either that field or the
+  // several `to` addresses is what Mailgun refuses from an uncleared domain; we never established
+  // which, and sending one at a time is pointless if the request still looks like a batch.
   const single = recipients.length === 1 ? recipients[0] : null;
   const unsubscribe = `${env.PUBLIC_URL}/unsubscribe?t=${single ? single.token : "%recipient.token%"}`;
   const form = new FormData();

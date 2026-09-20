@@ -28,8 +28,9 @@
     "MAILGUN_DOMAIN": "mail.example.com",
     // EU-region Mailgun accounts: https://api.eu.mailgun.net
     "MAILGUN_API_BASE": "https://api.mailgun.net",
-    // Recipients per Mailgun call. 1 sends individually, which new sending domains are allowed to
-    // do; raise it (max 1000) only once yours is cleared for batch sending.
+    // Recipients per Mailgun call. 1 avoids the batch-send shape Mailgun appears to refuse from
+    // uncleared domains; raise it (max 1000) once yours is cleared. Above ~1500 subscribers an
+    // issue takes several ticks to deliver at 1.
     "BATCH_SIZE": 1
   }
 }
