@@ -1,7 +1,7 @@
 import { env } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index";
-import { batchSize, DEFAULT_BATCH_SIZE, FLAG_AFTER_MS, MAX_CONSECUTIVE_FAILURES, parseFeed, STALE_MS, tick } from "../src/send";
+import { batchSize, DEFAULT_BATCH_SIZE, fitImages, FLAG_AFTER_MS, MAX_CONSECUTIVE_FAILURES, parseFeed, STALE_MS, tick } from "../src/send";
 
 const NOW = Date.parse("2026-09-18T12:00:00Z");
 const DAY = 24 * 60 * 60 * 1000;
@@ -374,6 +374,55 @@ describe("tick", () => {
     mailgunReply = (_f, n) => (n % 2 === 0 ? new Response("boom", { status: 500 }) : Response.json({}));
     await tick(env, NOW);
     expect(issueCalls()).toHaveLength(20); // every other one fails, so the streak never reaches the limit
+  });
+});
+
+describe("fitImages", () => {
+  const FIT = "max-width:100%;height:auto";
+
+  it("constrains an image sized for the web, keeping its other attributes", () => {
+    // Exactly what the feed emits: correct web markup that an email has no stylesheet to size.
+    const got = fitImages('<figure><img src="https://x.test/1.webp" alt="" width="1024" height="608" loading="eager"></figure>');
+    expect(got).toBe(
+      `<figure><img src="https://x.test/1.webp" alt="" width="1024" height="608" loading="eager" style="${FIT}"></figure>`,
+    );
+  });
+
+  it("appends to an existing style so its own declaration wins", () => {
+    expect(fitImages(`<img src="a.png" style="border-radius:8px">`)).toBe(
+      `<img src="a.png" style="border-radius:8px;${FIT}">`,
+    );
+    // A width the feed set for the web must not survive, or the image still blows out.
+    expect(fitImages(`<img src="a.png" style="max-width:1024px;">`)).toBe(`<img src="a.png" style="max-width:1024px;${FIT}">`);
+  });
+
+  it("handles self-closing tags, single quotes and several images", () => {
+    expect(fitImages(`<img src='a.png'/><p>x</p><img src="b.png">`)).toBe(
+      `<img src='a.png' style="${FIT}"/><p>x</p><img src="b.png" style="${FIT}">`,
+    );
+  });
+
+  it("leaves everything that isn't an image alone", () => {
+    const prose = '<p>An <a href="https://x.test">image</a> of a word: img.</p>';
+    expect(fitImages(prose)).toBe(prose);
+  });
+
+  it("reaches the sent email", async () => {
+    await addSubscribers(1, "a");
+    feedXml = feed([{ guid: "old", date: NOW - 30 * DAY }]);
+    await tick(env, NOW);
+    feedXml = feed([{ guid: "old", date: NOW - 30 * DAY }]).replace(
+      "<p>Body of old</p>",
+      '<p>Body</p><img src="https://x.test/hero.webp" width="1024" height="608">',
+    );
+    // The feed above only has "old"; publish a genuinely new item carrying an image.
+    feedXml = `<?xml version="1.0"?><rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/"><channel><title>t</title>${
+      `<item><title>Post new</title><link>https://example.com/new</link><guid>https://example.com/new</guid>` +
+      `<pubDate>${new Date(NOW - 60_000).toUTCString()}</pubDate>` +
+      `<content:encoded><![CDATA[<figure><img src="https://x.test/hero.webp" width="1024" height="608"></figure>]]></content:encoded></item>`
+    }</channel></rss>`;
+    await tick(env, NOW);
+    expect(issueCalls()[0].get("html")).toContain(`width="1024" height="608" style="${FIT}"`);
   });
 });
 
