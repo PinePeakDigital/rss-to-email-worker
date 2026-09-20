@@ -28,8 +28,11 @@ const alertCalls = () => calls.filter((f) => f.get("to") === env.ADMIN_EMAIL);
 const recipients = () => issueCalls().flatMap((f) => f.getAll("to") as string[]);
 /** The opt-in path: one provider call per 1000 recipients, as before individual sending. */
 const batched = { ...env, BATCH_SIZE: 1000 };
-/** A tick budget affording exactly n claimed ranges, plus the query ingest spends on the new item. */
-const affords = (n: number) => ({ queriesLeft: n * QUERIES_PER_SEND + 1 });
+/**
+ * A tick budget affording exactly n claimed ranges. The 2 is what ingest spends in these setups:
+ * one lookup over the feed's guids, and one insert for the single new item.
+ */
+const affords = (n: number) => ({ queriesLeft: n * QUERIES_PER_SEND + 2 });
 
 async function addSubscribers(n: number, prefix: string, status = "active") {
   await env.DB.prepare(
@@ -381,7 +384,8 @@ describe("tick", () => {
     // the D1 queries that claiming them spent, so the budget must stop after two of the three.
     await env.DB.prepare("UPDATE subscribers SET status = 'unsubscribed'").run();
     mailgunReply = () => Response.json({});
-    await tick(env, NOW + 3600_000, { queriesLeft: 2 * QUERIES_PER_CLAIM });
+    // One lookup over the feed's guids, then two retry ranges and nothing more.
+    await tick(env, NOW + 3600_000, { queriesLeft: 1 + 2 * QUERIES_PER_CLAIM });
     expect(issueCalls()).toHaveLength(3); // still no new calls
     const done = await env.DB.prepare("SELECT COUNT(*) AS n FROM batches WHERE status = 'sent'").first<{ n: number }>();
     expect(done?.n).toBe(2);
@@ -396,7 +400,7 @@ describe("tick", () => {
 
     // Enough for one claimed range and the one genuinely new item. Were every feed item inserted
     // again and left to ON CONFLICT, this tick would be 30 queries short and send nothing.
-    await tick(env, NOW, { queriesLeft: QUERIES_PER_SEND + 1 });
+    await tick(env, NOW, affords(1));
     expect(recipients()).toEqual(["a1@x.test"]);
   });
 
@@ -408,6 +412,48 @@ describe("tick", () => {
     // little to claim a range; were the phases budgeted separately, this would have sent.
     await tick(env, NOW, { queriesLeft: QUERIES_PER_SEND });
     expect(issueCalls()).toHaveLength(0);
+
+    await tick(env, NOW + 3600_000);
+    expect(recipients()).toEqual(["a1@x.test"]);
+  });
+
+  it("handles a feed longer than D1 will bind parameters for in one query", async () => {
+    await addSubscribers(1, "a");
+    // D1 binds at most 100 parameters per query, so the guid lookup has to go in chunks; asking
+    // about all of these at once throws instead.
+    const many = Array.from({ length: 150 }, (_, i) => ({ guid: `s${i}`, date: NOW - 30 * DAY }));
+    feedXml = feed(many);
+    await tick(env, NOW);
+    const seeded = await env.DB.prepare("SELECT COUNT(*) AS n FROM items").first<{ n: number }>();
+    expect(seeded?.n).toBe(150);
+
+    feedXml = feed([...many, { guid: "new", date: NOW - 60_000 }]);
+    await tick(env, NOW);
+    expect(recipients()).toEqual(["a1@x.test"]);
+  });
+
+  it("refuses to seed a feed it can't take whole, rather than emailing the remainder later", async () => {
+    await addSubscribers(1, "a");
+    feedXml = feed(["a", "b", "c", "d", "e"].map((guid) => ({ guid, date: NOW - 30 * DAY })));
+
+    // One query for the guid lookup, one left over for five items' worth of inserts.
+    const err = await tick(env, NOW, { queriesLeft: 2 }).then(() => null, (e: AggregateError) => e);
+    expect(String(err?.errors[0])).toContain("too many to seed");
+    // Nothing partially seeded: a left-out item would come back next tick looking new, and be sent.
+    const seeded = await env.DB.prepare("SELECT COUNT(*) AS n FROM items").first<{ n: number }>();
+    expect(seeded?.n).toBe(0);
+
+    await tick(env, NOW + 3600_000);
+    expect(calls).toHaveLength(0); // seeded properly this time, so still nothing to send
+  });
+
+  it("defers ingest entirely when the tick has nothing left, without inserting part of it", async () => {
+    await addSubscribers(1, "a");
+    await publishNewPost();
+
+    await tick(env, NOW, { queriesLeft: 0 });
+    expect(await env.DB.prepare("SELECT guid FROM items WHERE guid LIKE '%new'").first()).toBe(null);
+    expect(calls).toHaveLength(0);
 
     await tick(env, NOW + 3600_000);
     expect(recipients()).toEqual(["a1@x.test"]);
@@ -482,6 +528,17 @@ describe("suppress", () => {
     expect(await suppress(env, all, NOW + DAY, newRun())).toBe(10);
     const left = await env.DB.prepare("SELECT COUNT(*) AS n FROM subscribers WHERE status = 'active'").first<{ n: number }>();
     expect(left?.n).toBe(0);
+  });
+
+  it("stops at what the tick can afford when that is tighter than the per-tick cap", async () => {
+    await addSubscribers(20, "a");
+    const all = Array.from({ length: 20 }, (_, i) => ({ email: `a${i + 1}@x.test`, reason: "bounce" as const }));
+
+    // Seven queries left, well under MAX_SUPPRESSIONS_PER_TICK — so the budget is the binding
+    // constraint here, not the constant, which is what the other cap test pins.
+    expect(await suppress(env, all, NOW, newRun({ queriesLeft: 7 }))).toBe(7);
+    const left = await env.DB.prepare("SELECT COUNT(*) AS n FROM subscribers WHERE status = 'active'").first<{ n: number }>();
+    expect(left?.n).toBe(13);
   });
 
   it("keeps a provider reason when the reader later clicks unsubscribe", async () => {

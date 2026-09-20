@@ -40,9 +40,15 @@ export const MAX_CONSECUTIVE_FAILURES = 5;
 // somebody resolves by hand (docs/adr/0001), so every phase whose cost grows — feed ingest,
 // suppression, sending — asks spend() before it queries and yields to the next tick when refused.
 // Well below Cloudflare's 10,000 subrequests, which is not the binding limit here.
+// On the Workers Paid plan; the Free plan allows 50, which this worker would exceed on any real
+// list, so it assumes Paid as it did before.
 export const D1_QUERY_LIMIT = 1000;
-// Held back for the phases that must be able to finish whatever else ran: flagging, the admin
-// alerts, and the scan for open issues.
+// D1 binds at most this many parameters to one query, so a lookup over the feed goes in chunks.
+export const D1_MAX_BOUND_PARAMS = 100;
+// Held back for the one-off reads no phase charges for: the flagging UPDATE, the scan for unalerted
+// flagged batches, the seeding probe, the suppression list read, the scan for open issues, and one
+// scan for failed ranges per open issue — so a handful, plus one per issue open at once. Everything
+// whose cost grows with its input charges the budget instead.
 export const QUERY_RESERVE = 60;
 // Charged in two parts, so a pass that finds the issue finished doesn't pay for a send it never
 // makes: the cursor read and the recipient select, then the two-statement claim and the status
@@ -68,6 +74,17 @@ function spend(run: Run, want: number): number {
   const got = Math.min(Math.max(want, 0), run.queriesLeft);
   run.queriesLeft -= got;
   return got;
+}
+
+/**
+ * Whether the tick can afford all of `n`, charging it when so and nothing when not. All-or-nothing
+ * on purpose: work that needs the whole amount would otherwise leave a part-charge behind for the
+ * next phase to find missing, having done nothing with it.
+ */
+function afford(run: Run, n: number): boolean {
+  if (run.queriesLeft < n || Date.now() > run.deadline) return false;
+  run.queriesLeft -= n;
+  return true;
 }
 
 export function newRun(budget: Partial<Run> = {}): Run {
@@ -152,7 +169,7 @@ export async function tick(env: Env, now = Date.now(), budget: Partial<Run> = {}
     await env.DB.prepare("UPDATE batches SET status = 'flagged' WHERE status = 'in_flight' AND started_at < ?")
       .bind(now - FLAG_AFTER_MS)
       .run();
-    await alertFlagged(env, now);
+    await alertFlagged(env, now, run);
   });
   await attempt("feed ingest", () => ingestFeed(env, now, run));
   await attempt("suppressions", async () => {
@@ -195,13 +212,20 @@ async function ingestFeed(env: Env, now: number, run: Run) {
   const seeding = !(await env.DB.prepare("SELECT 1 FROM items LIMIT 1").first());
   // A feed republishes its whole contents every tick. Inserting every item and letting ON CONFLICT
   // discard it would spend one query per item per tick forever, which on a long feed leaves nothing
-  // for sending. One select says which are new, and after the first tick that is usually none.
-  const { results: known } = await env.DB.prepare(
-    `SELECT guid FROM items WHERE guid IN (${items.map(() => "?").join(",")})`,
-  )
-    .bind(...items.map((i) => i.guid))
-    .all<{ guid: string }>();
-  const seen = new Set(known.map((r) => r.guid));
+  // for sending. Asking which are already held costs one query per hundred instead, and after the
+  // first tick the answer is usually all of them.
+  const lookups = Math.ceil(items.length / D1_MAX_BOUND_PARAMS);
+  if (!afford(run, lookups)) return; // the next tick reads the feed again
+  const seen = new Set<string>();
+  for (let i = 0; i < items.length; i += D1_MAX_BOUND_PARAMS) {
+    const chunk = items.slice(i, i + D1_MAX_BOUND_PARAMS);
+    const { results } = await env.DB.prepare(
+      `SELECT guid FROM items WHERE guid IN (${chunk.map(() => "?").join(",")})`,
+    )
+      .bind(...chunk.map((c) => c.guid))
+      .all<{ guid: string }>();
+    for (const r of results) seen.add(r.guid);
+  }
   const fresh = items.filter((i) => !seen.has(i.guid));
   if (!fresh.length) return;
 
@@ -248,7 +272,7 @@ async function* retryClaims(env: Env, issue: Issue, now: number, run: Run): Asyn
     .bind(issue.guid)
     .all<{ id: number; after_id: number; last_id: number }>();
   for (const b of failed) {
-    if (spend(run, QUERIES_PER_CLAIM) < QUERIES_PER_CLAIM) return;
+    if (!afford(run, QUERIES_PER_CLAIM)) return;
     const claim = await db
       .prepare("UPDATE batches SET status = 'in_flight', started_at = ? WHERE id = ? AND status = 'failed'")
       .bind(now, b.id)
@@ -266,7 +290,7 @@ async function* retryClaims(env: Env, issue: Issue, now: number, run: Run): Asyn
 async function* freshClaims(env: Env, issue: Issue, now: number, run: Run): AsyncGenerator<Claim> {
   const db = env.DB;
   for (;;) {
-    if (spend(run, QUERIES_PER_PROBE) < QUERIES_PER_PROBE) return;
+    if (!afford(run, QUERIES_PER_PROBE)) return;
     const row = await db.prepare("SELECT cursor, done_at FROM items WHERE guid = ?").bind(issue.guid).first<{
       cursor: number;
       done_at: number | null;
@@ -288,7 +312,7 @@ async function* freshClaims(env: Env, issue: Issue, now: number, run: Run): Asyn
         .run();
       return;
     }
-    if (spend(run, QUERIES_PER_CLAIM) < QUERIES_PER_CLAIM) return; // next tick claims this range
+    if (!afford(run, QUERIES_PER_CLAIM)) return; // next tick claims this range
 
     const lastId = results[results.length - 1].id;
     // Both statements no-op if a concurrent tick already claimed this range.
@@ -311,7 +335,7 @@ async function* freshClaims(env: Env, issue: Issue, now: number, run: Run): Asyn
  * MAX_CONSECUTIVE_FAILURES in a row. The streak is checked before the next claim is pulled: a
  * claimed range is already in flight, so abandoning one would strand it into a flagged batch.
  */
-async function drain(env: Env, issue: Issue, claims: AsyncGenerator<Claim>, what: string): Promise<void> {
+async function deliverClaims(env: Env, issue: Issue, claims: AsyncGenerator<Claim>, what: string): Promise<void> {
   let refusals = 0; // this source's streak only
   for (;;) {
     if (refusals >= MAX_CONSECUTIVE_FAILURES) return giveUp(refusals, what);
@@ -322,8 +346,8 @@ async function drain(env: Env, issue: Issue, claims: AsyncGenerator<Claim>, what
 }
 
 async function sendIssue(env: Env, issue: Issue, now: number, run: Run) {
-  await drain(env, issue, retryClaims(env, issue, now, run), `retrying ${issue.guid}`);
-  await drain(env, issue, freshClaims(env, issue, now, run), `sending ${issue.guid}`);
+  await deliverClaims(env, issue, retryClaims(env, issue, now, run), `retrying ${issue.guid}`);
+  await deliverClaims(env, issue, freshClaims(env, issue, now, run), `sending ${issue.guid}`);
 }
 
 /**
@@ -531,11 +555,18 @@ export async function suppress(env: Env, entries: Suppression[], now: number, ru
   return hits.length;
 }
 
-async function alertFlagged(env: Env, now: number) {
+async function alertFlagged(env: Env, now: number, run: Run) {
   const { results } = await env.DB.prepare(
     "SELECT id, guid, after_id, last_id, started_at FROM batches WHERE status = 'flagged' AND alerted_at IS NULL",
   ).all<{ id: number; guid: string; after_id: number; last_id: number; started_at: number }>();
   for (const b of results) {
+    // One alert costs one write. Charged like any other growing phase: a provider outage can leave
+    // a tick's worth of flagged batches behind, and alerting on all of them unbudgeted would spend
+    // the queries the next phase is about to claim a range with.
+    if (!afford(run, 1)) {
+      console.error("out of queries before alerting every flagged batch; the next tick resumes");
+      return;
+    }
     const sql = (status: string) =>
       `npx wrangler d1 execute DB --remote --command "UPDATE batches SET status = '${status}' WHERE id = ${b.id} AND status = 'flagged'"`;
     const form = new FormData();
