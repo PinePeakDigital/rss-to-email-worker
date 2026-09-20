@@ -359,8 +359,14 @@ export async function fetchSuppressions(env: Env): Promise<{ entries: Suppressio
         failures.push(`${list} unparseable`);
         break;
       }
-      const items = body.items ?? [];
-      for (const i of items) if (i.address) found.push({ email: i.address, reason });
+      const items = body.items;
+      if (!Array.isArray(items)) {
+        console.error(`Mailgun ${list} response had no items array`);
+        failures.push(`${list} malformed`);
+        break;
+      }
+      // Typed rather than truthy: a non-string address would reach toLowerCase() and kill the phase.
+      for (const i of items) if (typeof i?.address === "string" && i.address) found.push({ email: i.address, reason });
       // paging.next is returned even at the end of the list, so a short page is the only real stop.
       if (items.length < SUPPRESSION_PAGE_SIZE || !body.paging?.next) break;
       url = body.paging.next;

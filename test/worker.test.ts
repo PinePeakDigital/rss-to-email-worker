@@ -456,6 +456,23 @@ describe("suppress", () => {
     expect(left?.n).toBe(0);
   });
 
+  it("keeps a provider reason when the reader later clicks unsubscribe", async () => {
+    await addSubscribers(1, "a");
+    await suppress(env, [{ email: "a1@x.test", reason: "complaint" }], NOW);
+    const token = await env.DB.prepare("SELECT token FROM subscribers WHERE email = 'a1@x.test'").first<string>("token");
+    const res = await worker.fetch(new Request(`${env.PUBLIC_URL}/unsubscribe?t=${token}`, { method: "POST" }), env);
+    expect(res.status).toBe(200);
+    // The complaint is the record worth keeping; 'self' must not overwrite it.
+    expect(await statusOf("a1@x.test")).toEqual({ status: "unsubscribed", reason: "complaint", at: NOW });
+  });
+
+  it("records 'self' when an active subscriber unsubscribes", async () => {
+    await addSubscribers(1, "a");
+    const token = await env.DB.prepare("SELECT token FROM subscribers WHERE email = 'a1@x.test'").first<string>("token");
+    await worker.fetch(new Request(`${env.PUBLIC_URL}/unsubscribe?t=${token}`, { method: "POST" }), env);
+    expect((await statusOf("a1@x.test"))?.reason).toBe("self");
+  });
+
   it("never sends to a suppressed subscriber again", async () => {
     await addSubscribers(3, "a");
     await suppress(env, [{ email: "a2@x.test", reason: "complaint" }], NOW);
@@ -485,6 +502,17 @@ describe("fetchSuppressions", () => {
       entries: [{ email: "angry@x.test", reason: "complaint" }],
       failures: ["bounces HTTP 500"],
     });
+  });
+
+  it("skips items whose address isn't a string, and fails on a malformed page", async () => {
+    // A well-behaved API shouldn't do either, but one bad item must not kill the whole phase.
+    suppressionReply = (list) =>
+      list === "bounces"
+        ? Response.json({ items: [{ address: 42 }, { address: null }, {}, { address: "ok@x.test" }], paging: {} })
+        : Response.json({ items: "not an array", paging: {} });
+    const { entries, failures } = await fetchSuppressions(env);
+    expect(entries).toEqual([{ email: "ok@x.test", reason: "bounce" }]);
+    expect(failures).toEqual(["complaints malformed"]);
   });
 
   it("treats an unreadable body as a failure, not an empty list", async () => {
