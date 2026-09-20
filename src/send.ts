@@ -27,6 +27,11 @@ export const MAX_BATCH_SIZE = 1000;
 // the budget is gone and the next one resumes from the cursor; without this, every row still
 // in flight when the Worker is killed would be flagged.
 export const SEND_BUDGET_MS = 10 * 60 * 1000;
+// Sized to leave D1's per-invocation query budget to sending: this costs one read plus one write
+// per subscriber suppressed, and the remainder waits for the next tick.
+export const MAX_SUPPRESSIONS_PER_TICK = 50;
+export const SUPPRESSION_PAGE_SIZE = 1000; // Mailgun's maximum for these lists
+export const SUPPRESSION_PAGES = 5;
 // A provider that is refusing everything would otherwise log once per recipient. Counted per send
 // loop, not per tick: a streak on one issue says nothing about the next one, and sharing the count
 // would let a few permanently bad addresses block every issue published afterwards.
@@ -75,6 +80,12 @@ export interface FeedItem {
 
 type Issue = Omit<FeedItem, "pubDate">;
 
+/** An address the provider will not deliver to, and why. */
+export interface Suppression {
+  email: string;
+  reason: "bounce" | "complaint";
+}
+
 interface Recipient {
   id: number;
   email: string;
@@ -120,6 +131,13 @@ export async function tick(env: Env, now = Date.now(), budget: Partial<Run> = {}
     await alertFlagged(env, now);
   });
   await attempt("feed ingest", () => ingestFeed(env, now));
+  await attempt("suppressions", async () => {
+    const { entries, failures } = await fetchSuppressions(env);
+    await suppress(env, entries, now);
+    // Reported like a feed failure: sending is unaffected, but a permanently dead suppression
+    // phase — a wrong path, a revoked key — is worth surfacing as a failed cron run.
+    if (failures.length) throw new Error(`could not read Mailgun suppression lists: ${failures.join("; ")}`);
+  });
 
   const { results } = await env.DB.prepare(
     `SELECT guid, title, link, html FROM items
@@ -288,13 +306,76 @@ function batchForm(env: Env, issue: Issue, batchId: number, recipients: Recipien
   return form;
 }
 
+function mailgunBase(env: Env): string {
+  return `${env.MAILGUN_API_BASE || "https://api.mailgun.net"}/v3/${env.MAILGUN_DOMAIN}`;
+}
+
+function mailgunAuth(env: Env): HeadersInit {
+  return { Authorization: `Basic ${btoa(`api:${env.MAILGUN_API_KEY}`)}` };
+}
+
 export function mailgun(env: Env, form: FormData): Promise<Response> {
-  const base = env.MAILGUN_API_BASE || "https://api.mailgun.net";
-  return fetch(`${base}/v3/${env.MAILGUN_DOMAIN}/messages`, {
-    method: "POST",
-    headers: { Authorization: `Basic ${btoa(`api:${env.MAILGUN_API_KEY}`)}` },
-    body: form,
-  });
+  return fetch(`${mailgunBase(env)}/messages`, { method: "POST", headers: mailgunAuth(env), body: form });
+}
+
+/**
+ * Mailgun's bounce and complaint lists, which are the authoritative record of who it will not
+ * deliver to. It already drops messages to these addresses on its own, so this exists to keep our
+ * table honest — stop spending a send on a dead address, and keep our own record of who complained.
+ *
+ * The lists carry no timestamp filter, so each tick walks them whole. That costs one request per
+ * 1,000 entries, which is a handful of requests for years.
+ * ponytail: full walk each tick; switch to the events API with a stored cursor if it outgrows
+ * SUPPRESSION_PAGES, which would silently start truncating the list.
+ */
+export async function fetchSuppressions(env: Env): Promise<{ entries: Suppression[]; failures: string[] }> {
+  const found: Suppression[] = [];
+  const failures: string[] = [];
+  // Mailgun's unsubscribes list is deliberately not read: this Worker uses its own tokenized
+  // unsubscribe links, not Mailgun's tracking, so that list should stay empty.
+  for (const [list, reason] of [
+    ["bounces", "bounce"],
+    ["complaints", "complaint"],
+  ] as const) {
+    let url = `${mailgunBase(env)}/${list}?limit=${SUPPRESSION_PAGE_SIZE}`;
+    for (let page = 0; page < SUPPRESSION_PAGES; page++) {
+      const res = await fetch(url, { headers: mailgunAuth(env) }).catch((e) => {
+        console.error(`could not read Mailgun ${list}:`, e);
+        return null;
+      });
+      if (!res) {
+        failures.push(list);
+        break;
+      }
+      if (!res.ok) {
+        console.error(`could not read Mailgun ${list}: HTTP ${res.status}`);
+        failures.push(`${list} HTTP ${res.status}`);
+        break;
+      }
+      const body = (await res.json().catch(() => null)) as { items?: { address?: string }[]; paging?: { next?: string } } | null;
+      if (!body) {
+        // A 200 with an unreadable body is not an empty list; say so rather than reading nothing.
+        console.error(`could not parse Mailgun ${list} response`);
+        failures.push(`${list} unparseable`);
+        break;
+      }
+      const items = body.items;
+      if (!Array.isArray(items)) {
+        console.error(`Mailgun ${list} response had no items array`);
+        failures.push(`${list} malformed`);
+        break;
+      }
+      // Typed rather than truthy: a non-string address would reach toLowerCase() and kill the phase.
+      for (const i of items) if (typeof i?.address === "string" && i.address) found.push({ email: i.address, reason });
+      // paging.next is returned even at the end of the list, so a short page is the only real stop.
+      if (items.length < SUPPRESSION_PAGE_SIZE || !body.paging?.next) break;
+      url = body.paging.next;
+      if (page === SUPPRESSION_PAGES - 1) console.error(`Mailgun ${list} is longer than ${SUPPRESSION_PAGES} pages; the rest was not read`);
+    }
+  }
+  // Failures are returned rather than thrown so the caller can apply what was read before
+  // reporting them — one unreadable list should not discard the other.
+  return { entries: found, failures };
 }
 
 export function esc(s: string): string {
@@ -331,6 +412,54 @@ ${fitImages(issue.html)}
 <a href="${esc(env.SITE_URL)}" style="color:#666">${esc(env.SITE_NAME)}</a>.
 <a href="${unsubscribe}" style="color:#666">Unsubscribe</a>.</p>
 </div></body></html>`;
+}
+
+/**
+ * Stops sending to addresses the provider has suppressed, recording which of the two it was.
+ *
+ * Reads our own list first and writes only for addresses we actually hold: the suppression list
+ * grows forever and can be far larger than the subscriber list, and D1 counts every statement in a
+ * batch against its 1,000-per-invocation ceiling. Applying at most MAX_SUPPRESSIONS_PER_TICK keeps
+ * this bounded alongside the send budget; the rest are picked up next tick, since the lists are
+ * re-read every time and applying them twice is a no-op.
+ *
+ * Pending rows are included: a typo'd address that bounced would otherwise sit pending forever,
+ * collecting a fresh confirmation email on every attempt to subscribe.
+ * Returns how many subscribers this changed.
+ */
+export async function suppress(env: Env, entries: Suppression[], now: number): Promise<number> {
+  if (!entries.length) return 0;
+  // Complaint wins when an address is on both lists: it is the more meaningful of the two.
+  const reasons = new Map<string, Suppression["reason"]>();
+  for (const e of entries) {
+    const email = e.email.toLowerCase();
+    if (e.reason === "complaint" || !reasons.has(email)) reasons.set(email, e.reason);
+  }
+
+  const { results } = await env.DB.prepare("SELECT email FROM subscribers WHERE status IN ('active', 'pending')").all<{
+    email: string;
+  }>();
+  const hits = results.filter((r) => reasons.has(r.email)).slice(0, MAX_SUPPRESSIONS_PER_TICK);
+  if (!hits.length) return 0;
+
+  await env.DB.batch(
+    hits.map((r) =>
+      env.DB.prepare(
+        `UPDATE subscribers SET status = 'unsubscribed', unsubscribed_at = ?, unsubscribe_reason = ?
+         WHERE email = ? AND status IN ('active', 'pending')`,
+      ).bind(now, reasons.get(r.email), r.email),
+    ),
+  );
+  // Worth a line even though it is routine: a complaint is a person saying they did not want this.
+  // Counts and reasons only, never the addresses — this log leaves the account, and who bounced or
+  // complained is not something to hand to an error tracker. D1 has the detail if it is needed.
+  const byReason = hits.reduce<Record<string, number>>((acc, r) => {
+    const reason = reasons.get(r.email) as string;
+    acc[reason] = (acc[reason] ?? 0) + 1;
+    return acc;
+  }, {});
+  console.error(`suppressed ${hits.length} subscriber(s):`, JSON.stringify(byReason));
+  return hits.length;
 }
 
 async function alertFlagged(env: Env, now: number) {

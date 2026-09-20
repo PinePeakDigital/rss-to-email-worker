@@ -64,7 +64,10 @@ async function confirm(env: Env, token: string): Promise<Response> {
     `UPDATE subscribers SET
        consent_at = CASE status WHEN 'active' THEN consent_at ELSE ? END,
        consent_source = CASE status WHEN 'active' THEN consent_source ELSE 'form' END,
-       status = 'active'
+       status = 'active',
+       -- Becoming active again clears why they last left, so the pair never describes an active row.
+       unsubscribed_at = NULL,
+       unsubscribe_reason = NULL
      WHERE token = ?`,
   )
     .bind(Date.now(), token)
@@ -74,7 +77,17 @@ async function confirm(env: Env, token: string): Promise<Response> {
 }
 
 async function unsubscribe(req: Request, env: Env, token: string): Promise<Response> {
-  const { meta } = await env.DB.prepare("UPDATE subscribers SET status = 'unsubscribed' WHERE token = ?").bind(token).run();
+  const { meta } = await env.DB.prepare(
+    // Only the transition off the list records a reason: someone who bounced or complained and then
+    // clicks an unsubscribe link in an old email keeps that record rather than overwriting it.
+    `UPDATE subscribers SET
+       unsubscribed_at = CASE status WHEN 'unsubscribed' THEN unsubscribed_at ELSE ? END,
+       unsubscribe_reason = CASE status WHEN 'unsubscribed' THEN unsubscribe_reason ELSE 'self' END,
+       status = 'unsubscribed'
+     WHERE token = ?`,
+  )
+    .bind(Date.now(), token)
+    .run();
   const form = await req.formData().catch(() => null);
   // RFC 8058 one-click: a mail provider posting on the reader's behalf, nobody to show a page to.
   if (form?.get("List-Unsubscribe") === "One-Click") return new Response(null, { status: meta.changes ? 200 : 404 });

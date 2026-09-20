@@ -1,7 +1,7 @@
 import { env } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index";
-import { batchSize, DEFAULT_BATCH_SIZE, fitImages, FLAG_AFTER_MS, MAX_CONSECUTIVE_FAILURES, parseFeed, STALE_MS, tick } from "../src/send";
+import { batchSize, DEFAULT_BATCH_SIZE, fetchSuppressions, fitImages, FLAG_AFTER_MS, MAX_CONSECUTIVE_FAILURES, MAX_SUPPRESSIONS_PER_TICK, parseFeed, STALE_MS, suppress, SUPPRESSION_PAGES, tick } from "../src/send";
 
 const NOW = Date.parse("2026-09-18T12:00:00Z");
 const DAY = 24 * 60 * 60 * 1000;
@@ -19,6 +19,9 @@ function feed(items: { guid: string; date: number }[]): string {
 let feedXml: string | null; // null: the feed host is down
 let calls: FormData[];
 let mailgunReply: (form: FormData, n: number) => Response | Promise<Response>;
+let bounces: { address: string }[];
+let complaints: { address: string }[];
+let suppressionReply: ((list: string) => Response | null) | null;
 
 const issueCalls = () => calls.filter((f) => f.has("v:batch"));
 const alertCalls = () => calls.filter((f) => f.get("to") === env.ADMIN_EMAIL);
@@ -49,6 +52,9 @@ beforeEach(async () => {
   feedXml = feed([]);
   calls = [];
   mailgunReply = () => Response.json({ id: "x" });
+  bounces = [];
+  complaints = [];
+  suppressionReply = null;
   await env.DB.batch(["batches", "items", "subscribers"].map((t) => env.DB.prepare(`DELETE FROM ${t}`)));
   vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const url = input instanceof Request ? input.url : String(input);
@@ -57,6 +63,17 @@ beforeEach(async () => {
       const form = init!.body as FormData;
       calls.push(form);
       return mailgunReply(form, calls.length);
+    }
+    for (const list of ["bounces", "complaints"]) {
+      if (url.includes(`/${list}`)) {
+        const override = suppressionReply?.(list);
+        if (override) return override;
+        // Mailgun returns paging.next even on the last page, so a short page is the only real end.
+        return Response.json({
+          items: list === "bounces" ? bounces : complaints,
+          paging: { next: `https://api.mailgun.net/v3/d/${list}?page=next` },
+        });
+      }
     }
     if (url.includes("turnstile")) return Response.json({ success: true, action: "subscribe", hostname: "example.com" });
     throw new Error(`unexpected fetch: ${url}`);
@@ -374,6 +391,181 @@ describe("tick", () => {
     mailgunReply = (_f, n) => (n % 2 === 0 ? new Response("boom", { status: 500 }) : Response.json({}));
     await tick(env, NOW);
     expect(issueCalls()).toHaveLength(20); // every other one fails, so the streak never reaches the limit
+  });
+});
+
+describe("suppress", () => {
+  const statusOf = async (email: string) =>
+    env.DB.prepare("SELECT status, unsubscribe_reason AS reason, unsubscribed_at AS at FROM subscribers WHERE email = ?")
+      .bind(email)
+      .first<{ status: string; reason: string | null; at: number | null }>();
+
+  it("stops sending to a bounced or complaining address and records which", async () => {
+    await addSubscribers(3, "a");
+    expect(
+      await suppress(env, [
+        { email: "a1@x.test", reason: "bounce" },
+        { email: "A2@X.TEST", reason: "complaint" }, // provider casing must still match
+      ], NOW),
+    ).toBe(2);
+
+    expect(await statusOf("a1@x.test")).toEqual({ status: "unsubscribed", reason: "bounce", at: NOW });
+    expect(await statusOf("a2@x.test")).toEqual({ status: "unsubscribed", reason: "complaint", at: NOW });
+    expect((await statusOf("a3@x.test"))?.status).toBe("active");
+  });
+
+  it("leaves someone who already left alone, keeping their original reason", async () => {
+    await addSubscribers(1, "a");
+    await suppress(env, [{ email: "a1@x.test", reason: "complaint" }], NOW);
+    expect(await suppress(env, [{ email: "a1@x.test", reason: "bounce" }], NOW + DAY)).toBe(0);
+    expect(await statusOf("a1@x.test")).toEqual({ status: "unsubscribed", reason: "complaint", at: NOW });
+  });
+
+  it("ignores an address it doesn't have, but does suppress a pending one", async () => {
+    await addSubscribers(1, "p", "pending");
+    // A typo'd address that bounced would otherwise sit pending forever, collecting a fresh
+    // confirmation email every time someone tried to subscribe it.
+    expect(
+      await suppress(env, [
+        { email: "nobody@x.test", reason: "bounce" },
+        { email: "p1@x.test", reason: "bounce" },
+      ], NOW),
+    ).toBe(1);
+    expect(await statusOf("p1@x.test")).toEqual({ status: "unsubscribed", reason: "bounce", at: NOW });
+  });
+
+  // Whichever order the lists arrive in: a complaint is the more meaningful of the two.
+  it.each([
+    ["bounce first", ["bounce", "complaint"]],
+    ["complaint first", ["complaint", "bounce"]],
+  ] as const)("prefers complaint over bounce when an address is on both lists, %s", async (_name, order) => {
+    await addSubscribers(1, "a");
+    await suppress(env, order.map((reason) => ({ email: "a1@x.test", reason })), NOW);
+    expect((await statusOf("a1@x.test"))?.reason).toBe("complaint");
+  });
+
+  it("applies at most a tick's worth and leaves the rest for the next one", async () => {
+    await addSubscribers(MAX_SUPPRESSIONS_PER_TICK + 10, "a");
+    const all = Array.from({ length: MAX_SUPPRESSIONS_PER_TICK + 10 }, (_, i) => ({
+      email: `a${i + 1}@x.test`,
+      reason: "bounce" as const,
+    }));
+    expect(await suppress(env, all, NOW)).toBe(MAX_SUPPRESSIONS_PER_TICK);
+    expect(await suppress(env, all, NOW + DAY)).toBe(10);
+    const left = await env.DB.prepare("SELECT COUNT(*) AS n FROM subscribers WHERE status = 'active'").first<{ n: number }>();
+    expect(left?.n).toBe(0);
+  });
+
+  it("keeps a provider reason when the reader later clicks unsubscribe", async () => {
+    await addSubscribers(1, "a");
+    await suppress(env, [{ email: "a1@x.test", reason: "complaint" }], NOW);
+    const token = await env.DB.prepare("SELECT token FROM subscribers WHERE email = 'a1@x.test'").first<string>("token");
+    const res = await worker.fetch(new Request(`${env.PUBLIC_URL}/unsubscribe?t=${token}`, { method: "POST" }), env);
+    expect(res.status).toBe(200);
+    // The complaint is the record worth keeping; 'self' must not overwrite it.
+    expect(await statusOf("a1@x.test")).toEqual({ status: "unsubscribed", reason: "complaint", at: NOW });
+  });
+
+  it("records 'self' when an active subscriber unsubscribes", async () => {
+    await addSubscribers(1, "a");
+    const token = await env.DB.prepare("SELECT token FROM subscribers WHERE email = 'a1@x.test'").first<string>("token");
+    await worker.fetch(new Request(`${env.PUBLIC_URL}/unsubscribe?t=${token}`, { method: "POST" }), env);
+    expect((await statusOf("a1@x.test"))?.reason).toBe("self");
+  });
+
+  it("never sends to a suppressed subscriber again", async () => {
+    await addSubscribers(3, "a");
+    await suppress(env, [{ email: "a2@x.test", reason: "complaint" }], NOW);
+    await publishNewPost();
+    await tick(env, NOW);
+    expect(recipients().sort()).toEqual(["a1@x.test", "a3@x.test"]);
+  });
+});
+
+describe("fetchSuppressions", () => {
+  it("reads both lists once each, despite a next link on the last page", async () => {
+    bounces = [{ address: "dead@x.test" }];
+    complaints = [{ address: "angry@x.test" }];
+    expect(await fetchSuppressions(env)).toEqual({
+      entries: [
+        { email: "dead@x.test", reason: "bounce" },
+        { email: "angry@x.test", reason: "complaint" },
+      ],
+      failures: [],
+    });
+  });
+
+  it("returns what it could read, and names the list it could not", async () => {
+    complaints = [{ address: "angry@x.test" }];
+    suppressionReply = (list) => (list === "bounces" ? new Response("nope", { status: 500 }) : null);
+    expect(await fetchSuppressions(env)).toEqual({
+      entries: [{ email: "angry@x.test", reason: "complaint" }],
+      failures: ["bounces HTTP 500"],
+    });
+  });
+
+  it("skips items whose address isn't a string, and fails on a malformed page", async () => {
+    // A well-behaved API shouldn't do either, but one bad item must not kill the whole phase.
+    suppressionReply = (list) =>
+      list === "bounces"
+        ? Response.json({ items: [{ address: 42 }, { address: null }, {}, { address: "ok@x.test" }], paging: {} })
+        : Response.json({ items: "not an array", paging: {} });
+    const { entries, failures } = await fetchSuppressions(env);
+    expect(entries).toEqual([{ email: "ok@x.test", reason: "bounce" }]);
+    expect(failures).toEqual(["complaints malformed"]);
+  });
+
+  it("treats an unreadable body as a failure, not an empty list", async () => {
+    suppressionReply = () => new Response("<html>nope</html>", { headers: { "content-type": "text/html" } });
+    const { entries, failures } = await fetchSuppressions(env);
+    expect(entries).toEqual([]);
+    expect(failures).toEqual(["bounces unparseable", "complaints unparseable"]);
+  });
+
+  it("stops after the page cap instead of following pages forever", async () => {
+    let pages = 0;
+    // A full page plus a next link: without the cap this would never terminate.
+    suppressionReply = (list) => {
+      if (list !== "bounces") return null;
+      pages++;
+      return Response.json({
+        items: Array.from({ length: 1000 }, (_, i) => ({ address: `b${pages}-${i}@x.test` })),
+        paging: { next: "https://api.mailgun.net/v3/d/bounces?page=next" },
+      });
+    };
+    const { entries } = await fetchSuppressions(env);
+    expect(pages).toBe(SUPPRESSION_PAGES);
+    expect(entries).toHaveLength(SUPPRESSION_PAGES * 1000);
+  });
+
+  it("suppresses during a tick, before that address would be sent to", async () => {
+    await addSubscribers(3, "a");
+    await publishNewPost();
+    bounces = [{ address: "a2@x.test" }];
+    await tick(env, NOW);
+    expect(recipients().sort()).toEqual(["a1@x.test", "a3@x.test"]);
+    const row = await env.DB.prepare("SELECT status, unsubscribe_reason AS r FROM subscribers WHERE email = 'a2@x.test'").first<{
+      status: string;
+      r: string;
+    }>();
+    expect(row).toEqual({ status: "unsubscribed", r: "bounce" });
+  });
+
+  it("keeps sending when the suppression lists are unreachable, but reports the failure", async () => {
+    await addSubscribers(2, "a");
+    await publishNewPost();
+    suppressionReply = () => new Response("down", { status: 503 });
+    await expect(tick(env, NOW)).rejects.toThrow(AggregateError);
+    expect(recipients().sort()).toEqual(["a1@x.test", "a2@x.test"]);
+  });
+
+  it("applies the list it could read even when the other one fails", async () => {
+    await addSubscribers(2, "a");
+    await publishNewPost();
+    complaints = [{ address: "a1@x.test" }];
+    suppressionReply = (list) => (list === "bounces" ? new Response("down", { status: 503 }) : null);
+    await expect(tick(env, NOW)).rejects.toThrow(AggregateError);
+    expect(recipients()).toEqual(["a2@x.test"]);
   });
 });
 
