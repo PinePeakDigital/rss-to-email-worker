@@ -3,7 +3,7 @@
 Emails new items from an RSS feed to double-opt-in subscribers. It runs on Cloudflare Workers and D1, and sends through Mailgun. Built for the [Narthur Online](https://nathanarthur.com) newsletter, and configurable for any feed.
 
 - **Subscribe:** an HTML form on your site, protected by Turnstile, with double opt-in. The consent time and source are recorded.
-- **Send:** an hourly cron fetches the feed and emails each new item, as a full post in a light template, to every active subscriber. It sends one message per recipient by default, because Mailgun refuses batch sends from a domain it hasn't cleared yet — silently enough to be easy to miss. Set `BATCH_SIZE` up to 1,000 to batch once yours is cleared.
+- **Send:** an hourly cron fetches the feed and emails each new item, as a full post in a light template, to every active subscriber. It sends one message per recipient by default, because Mailgun refuses large batches from a new sending domain (`403 … is not allowed to send large batches yet`) quietly enough to be easy to miss. Set `BATCH_SIZE` up to 1,000 to batch once yours is allowed — which, since Mailgun documents none of this and exposes no way to query it, you can only learn by trying. See [ADR 0002](docs/adr/0002-send-individually-by-default.md).
 - **Unsubscribe:** a tokenized link in every email, plus RFC 8058 one-click `List-Unsubscribe` headers, which Gmail and Yahoo require from bulk senders.
 
 ## How sending stays correct
@@ -54,7 +54,7 @@ Imported subscribers are active, with consent source `substack-import` and their
 - If a post's GUID changes within 7 days of publishing (a renamed file, say), the post is sent again.
 - Scheduling is the feed's job. A future-dated item that's in the feed gets sent on the next tick.
 - Bounces and complaints are suppressed by Mailgun, but not mirrored into D1.
-- At the default `BATCH_SIZE` of 1, a tick delivers at most 150 messages, so a list of a few hundred takes several hours to receive an issue and a few thousand takes a day. Batching is about a thousand times cheaper per recipient in D1 queries, so raise `BATCH_SIZE` once your sending domain is cleared for it — well before the list makes the wait a problem.
+- At the default `BATCH_SIZE` of 1, a tick delivers at most 150 messages, so a list of a few hundred takes several hours to receive an issue and a few thousand takes a day. Batching is about a thousand times cheaper per recipient in D1 queries, so raise `BATCH_SIZE` as soon as Mailgun allows it — well before the list makes the wait a problem. Note the refusal is about *large* batches, so a modest size may be accepted long before 1,000 is; test upward against addresses you control, and see ADR 0002 for how to recover the rows a refused attempt leaves behind.
 - An address Mailgun permanently rejects is retried every tick forever. Five such addresses on one issue consume that issue's whole retry phase each tick.
 
 ## Development

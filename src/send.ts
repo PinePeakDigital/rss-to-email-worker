@@ -18,9 +18,9 @@ export interface Env {
 export const STALE_MS = 7 * 24 * 60 * 60 * 1000;
 // A batch still in flight after this is presumed dead mid-send and flagged.
 export const FLAG_AFTER_MS = 15 * 60 * 1000;
-// One recipient per call by default: providers commonly refuse batch sends from a new domain,
-// and the refusal is easy to miss. Raise BATCH_SIZE (up to 1000, the provider's per-call limit)
-// to send in batches again — worth it only once the domain is known to be allowed to.
+// One recipient per call by default: Mailgun 403s a large batch from a new sending domain
+// ("is not allowed to send large batches yet") and the refusal is easy to miss. Raise BATCH_SIZE
+// (up to 1000, Mailgun's per-batch limit) once it is allowed — see docs/adr/0002.
 export const DEFAULT_BATCH_SIZE = 1;
 export const MAX_BATCH_SIZE = 1000;
 // Sending is sequential, so a long list can outrun the cron wall-clock limit. A tick stops when
@@ -269,9 +269,9 @@ async function deliver(env: Env, issue: Issue, batchId: number, recipients: Reci
 }
 
 function batchForm(env: Env, issue: Issue, batchId: number, recipients: Recipient[]): FormData {
-  // A single recipient gets its real token and no recipient-variables. Either that field or the
-  // several `to` addresses is what Mailgun refuses from an uncleared domain; we never established
-  // which, and sending one at a time is pointless if the request still looks like a batch.
+  // A single recipient gets its real token and no recipient-variables. Mailgun refuses large
+  // batches from a new domain by recipient count, so this field isn't what trips it, but it is
+  // meaningless for one recipient and dropping it keeps the request plainly not a batch.
   const single = recipients.length === 1 ? recipients[0] : null;
   const unsubscribe = `${env.PUBLIC_URL}/unsubscribe?t=${single ? single.token : "%recipient.token%"}`;
   const form = new FormData();

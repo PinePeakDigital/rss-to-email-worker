@@ -1,10 +1,42 @@
 # Send one message per recipient by default
 
-Mailgun refuses batch sends from a sending domain it hasn't cleared, and the refusal is easy to miss: the batch is marked `failed`, retried on the next tick, and retried again, while the cron run reports success. A new deployment can sit there sending nothing. Anyone standing this up on a fresh domain hits it, so the default should be the mode that works on day one.
+Mailgun refuses large batch sends from a new sending domain, and the refusal is easy to miss: the batch is marked `failed`, retried on the next tick, and retried again, while the cron run reports success. A new deployment can sit there sending nothing. Anyone standing this up on a fresh domain hits it, so the default should be the mode that works on day one.
 
-`BATCH_SIZE` now sets recipients per provider call and defaults to 1. Raise it, up to the provider's limit of 1,000, once the domain is cleared for batch sending.
+The refusal observed in production:
 
-A single-recipient message carries no `recipient-variables` and its real unsubscribe token rather than `%recipient.token%`. Which of the two — several `to` addresses, or the presence of `recipient-variables` — actually triggers the refusal was never established, and sending one at a time is pointless if the request still looks like a batch, so the code avoids both.
+```
+HTTP 403 {"message":"Domain mail.example.com is not allowed to send large batches yet"}
+```
+
+`BATCH_SIZE` now sets recipients per provider call and defaults to 1. Raise it, up to Mailgun's limit of 1,000 recipients per batch, when the domain is allowed to batch.
+
+That message settles what the gate is: recipient count, not the `recipient-variables` field. Nothing else about it is knowable. Mailgun documents no such restriction at all — neither the batch-sending page nor the `POST /v3/<domain>/messages` reference mentions domain age, verification, plan or reputation as affecting batch sending — so the threshold ("large"), the schedule, and the criteria are all undocumented, and no API reports whether batching is currently permitted. The word "yet" is the only indication that it lifts.
+
+**So there is no signal to wait for. The only way to know is to send a batch and read the response.** Two adjacent things *are* checkable and worth confirming first, though neither is the batch gate: `GET /v4/domains/<domain>` reports `state` as `active`, `unverified` or `disabled`, and an unverified domain is separately capped at 300 messages a day.
+
+A single-recipient message still carries no `recipient-variables`, and its real unsubscribe token rather than `%recipient.token%`. That field is meaningless for one recipient, so dropping it costs nothing and keeps the request plainly outside whatever Mailgun classifies as a batch.
+
+## Recovering from a raised `BATCH_SIZE` that was refused
+
+Raising `BATCH_SIZE` is an experiment, and the retry path re-sends a `failed` range whole rather than re-chunking it to the current setting. Lowering the value back therefore does not drain rows claimed at the higher one: they keep being retried as wide batches and keep being refused.
+
+Splitting them in code is not worth it. Splitting a 1,000-wide range into single-recipient rows costs 1,000 D1 statements, which exceeds the per-invocation limit by itself; splitting one chunk per tick would take thousands of ticks to drain; and chunking under a single row breaks at-most-once, because a failure partway through re-sends the earlier chunks on the next attempt.
+
+A 403 delivers nothing, though, so the rows can simply be discarded and the ground recovered:
+
+```sh
+# The lowest subscriber id any refused range covers, per issue.
+npx wrangler d1 execute DB --remote --command \
+  "SELECT guid, MIN(after_id) AS rewind FROM batches WHERE status = 'failed' GROUP BY guid"
+
+# Drop the refused ranges and rewind that issue's cursor to before them.
+npx wrangler d1 execute DB --remote --command \
+  "DELETE FROM batches WHERE guid = '<guid>' AND status = 'failed'"
+npx wrangler d1 execute DB --remote --command \
+  "UPDATE items SET cursor = <rewind>, done_at = NULL WHERE guid = '<guid>'"
+```
+
+The next tick re-covers those subscribers at the current `BATCH_SIZE`. Only do this for ranges refused with a 403; a range that failed for another reason may have been delivered, which is what `flagged` exists for.
 
 ## Consequences
 
