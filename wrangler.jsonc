@@ -6,6 +6,8 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-08-15",
   "triggers": { "crons": ["0 * * * *"] },
+  // console.error from tick/send is the only record of Mailgun failures: keep logs on.
+  "observability": { "enabled": true, "logs": { "enabled": true } },
   "routes": [{ "pattern": "mail.example.com", "custom_domain": true }],
   "d1_databases": [
     {
