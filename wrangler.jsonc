@@ -6,8 +6,8 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-08-15",
   "triggers": { "crons": ["0 * * * *"] },
-  // Invocation logs only: cheap request/cron records without the console.log volume.
-  "observability": { "logs": { "enabled": false, "invocation_logs": true } },
+  // console.error from tick/send is the only record of Mailgun failures: keep logs on.
+  "observability": { "enabled": true, "logs": { "enabled": true } },
   "routes": [{ "pattern": "mail.example.com", "custom_domain": true }],
   "d1_databases": [
     {
