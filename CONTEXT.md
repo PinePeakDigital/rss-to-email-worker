@@ -39,7 +39,7 @@ The sending of one item to the subscriber list.
 _Avoid_: Send, campaign, newsletter (for a single send)
 
 **Tick**:
-One cron run. Holds a budget — a wall-clock deadline and a share of D1's per-invocation query limit — that every phase draws from and none may exceed; work that doesn't fit waits for the next tick.
+One cron run. Holds a budget — a wall-clock deadline and a share of D1's per-invocation query limit — that every phase whose cost grows with its input draws from; work that doesn't fit waits for the next tick.
 _Avoid_: Run, cycle, job
 
 **Claim**:

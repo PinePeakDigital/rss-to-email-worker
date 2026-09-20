@@ -1,7 +1,7 @@
 import { env } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index";
-import { batchSize, DEFAULT_BATCH_SIZE, fetchSuppressions, fitImages, FLAG_AFTER_MS, MAX_CONSECUTIVE_FAILURES, MAX_SUPPRESSIONS_PER_TICK, newRun, parseFeed, QUERIES_PER_CLAIM, QUERIES_PER_SEND, STALE_MS, suppress, SUPPRESSION_PAGES, tick } from "../src/send";
+import { batchSize, DEFAULT_BATCH_SIZE, fetchSuppressions, fitImages, FLAG_AFTER_MS, MAX_CONSECUTIVE_FAILURES, MAX_SUPPRESSIONS_PER_TICK, newBudget, parseFeed, QUERIES_PER_CLAIM, QUERIES_PER_SEND, STALE_MS, suppress, SUPPRESSION_PAGES, tick } from "../src/send";
 
 const NOW = Date.parse("2026-09-18T12:00:00Z");
 const DAY = 24 * 60 * 60 * 1000;
@@ -362,7 +362,7 @@ describe("tick", () => {
     expect(second).toContain("a12@x.test");
   });
 
-  it("stops at the per-tick send cap and resumes on the next tick", async () => {
+  it("stops when the query budget runs out and resumes on the next tick", async () => {
     await addSubscribers(8, "a");
     await publishNewPost();
     await tick(env, NOW, affords(3));
@@ -408,8 +408,8 @@ describe("tick", () => {
     await addSubscribers(1, "a");
     await publishNewPost();
 
-    // Exactly one range's worth. Ingest takes one of those queries for the new item, leaving too
-    // little to claim a range; were the phases budgeted separately, this would have sent.
+    // Exactly one range's worth. Ingest takes two of them — the guid lookup and the insert —
+    // leaving too little to claim a range; budgeted separately, this would have sent.
     await tick(env, NOW, { queriesLeft: QUERIES_PER_SEND });
     expect(issueCalls()).toHaveLength(0);
 
@@ -480,7 +480,7 @@ describe("suppress", () => {
       await suppress(env, [
         { email: "a1@x.test", reason: "bounce" },
         { email: "A2@X.TEST", reason: "complaint" }, // provider casing must still match
-      ], NOW, newRun()),
+      ], NOW, newBudget()),
     ).toBe(2);
 
     expect(await statusOf("a1@x.test")).toEqual({ status: "unsubscribed", reason: "bounce", at: NOW });
@@ -490,8 +490,8 @@ describe("suppress", () => {
 
   it("leaves someone who already left alone, keeping their original reason", async () => {
     await addSubscribers(1, "a");
-    await suppress(env, [{ email: "a1@x.test", reason: "complaint" }], NOW, newRun());
-    expect(await suppress(env, [{ email: "a1@x.test", reason: "bounce" }], NOW + DAY, newRun())).toBe(0);
+    await suppress(env, [{ email: "a1@x.test", reason: "complaint" }], NOW, newBudget());
+    expect(await suppress(env, [{ email: "a1@x.test", reason: "bounce" }], NOW + DAY, newBudget())).toBe(0);
     expect(await statusOf("a1@x.test")).toEqual({ status: "unsubscribed", reason: "complaint", at: NOW });
   });
 
@@ -503,7 +503,7 @@ describe("suppress", () => {
       await suppress(env, [
         { email: "nobody@x.test", reason: "bounce" },
         { email: "p1@x.test", reason: "bounce" },
-      ], NOW, newRun()),
+      ], NOW, newBudget()),
     ).toBe(1);
     expect(await statusOf("p1@x.test")).toEqual({ status: "unsubscribed", reason: "bounce", at: NOW });
   });
@@ -514,7 +514,7 @@ describe("suppress", () => {
     ["complaint first", ["complaint", "bounce"]],
   ] as const)("prefers complaint over bounce when an address is on both lists, %s", async (_name, order) => {
     await addSubscribers(1, "a");
-    await suppress(env, order.map((reason) => ({ email: "a1@x.test", reason })), NOW, newRun());
+    await suppress(env, order.map((reason) => ({ email: "a1@x.test", reason })), NOW, newBudget());
     expect((await statusOf("a1@x.test"))?.reason).toBe("complaint");
   });
 
@@ -524,8 +524,8 @@ describe("suppress", () => {
       email: `a${i + 1}@x.test`,
       reason: "bounce" as const,
     }));
-    expect(await suppress(env, all, NOW, newRun())).toBe(MAX_SUPPRESSIONS_PER_TICK);
-    expect(await suppress(env, all, NOW + DAY, newRun())).toBe(10);
+    expect(await suppress(env, all, NOW, newBudget())).toBe(MAX_SUPPRESSIONS_PER_TICK);
+    expect(await suppress(env, all, NOW + DAY, newBudget())).toBe(10);
     const left = await env.DB.prepare("SELECT COUNT(*) AS n FROM subscribers WHERE status = 'active'").first<{ n: number }>();
     expect(left?.n).toBe(0);
   });
@@ -536,14 +536,14 @@ describe("suppress", () => {
 
     // Seven queries left, well under MAX_SUPPRESSIONS_PER_TICK — so the budget is the binding
     // constraint here, not the constant, which is what the other cap test pins.
-    expect(await suppress(env, all, NOW, newRun({ queriesLeft: 7 }))).toBe(7);
+    expect(await suppress(env, all, NOW, newBudget({ queriesLeft: 7 }))).toBe(7);
     const left = await env.DB.prepare("SELECT COUNT(*) AS n FROM subscribers WHERE status = 'active'").first<{ n: number }>();
     expect(left?.n).toBe(13);
   });
 
   it("keeps a provider reason when the reader later clicks unsubscribe", async () => {
     await addSubscribers(1, "a");
-    await suppress(env, [{ email: "a1@x.test", reason: "complaint" }], NOW, newRun());
+    await suppress(env, [{ email: "a1@x.test", reason: "complaint" }], NOW, newBudget());
     const token = await env.DB.prepare("SELECT token FROM subscribers WHERE email = 'a1@x.test'").first<string>("token");
     const res = await worker.fetch(new Request(`${env.PUBLIC_URL}/unsubscribe?t=${token}`, { method: "POST" }), env);
     expect(res.status).toBe(200);
@@ -560,7 +560,7 @@ describe("suppress", () => {
 
   it("never sends to a suppressed subscriber again", async () => {
     await addSubscribers(3, "a");
-    await suppress(env, [{ email: "a2@x.test", reason: "complaint" }], NOW, newRun());
+    await suppress(env, [{ email: "a2@x.test", reason: "complaint" }], NOW, newBudget());
     await publishNewPost();
     await tick(env, NOW);
     expect(recipients().sort()).toEqual(["a1@x.test", "a3@x.test"]);
