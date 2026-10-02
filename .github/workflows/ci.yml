@@ -1,22 +1,24 @@
 name: CI
 
-on:
-  push:
-    branches: [main]
-  pull_request:
+# Every branch. A same-repo pull request shows this run as its check, since a check attaches to
+# the commit sha whatever triggered it. A pull request from a fork pushes nothing here, so it gets
+# no CI at all — there are no forks, and deploying moved to its own workflow, so add
+# `pull_request:` if that ever changes.
+on: push
 
-# Read-only is all either job needs: nothing here comments on a PR or writes to the repo.
+# Read-only is all this needs: nothing here comments on a PR or writes to the repo.
 permissions:
   contents: read
 
-# A second merge shouldn't deploy over a deploy still in flight.
+# A newer push to the same branch supersedes this run. The deploy has its own group and is
+# never cancelled.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
-  ci:
-    name: Typecheck, test, and deploy
+  check:
+    name: Typecheck and test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -30,14 +32,3 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
-      # Migrations stay manual (`npm run db:migrate`): they are rare, and ordering one against a
-      # deploy is fiddly enough that a late migration beats a wrong one.
-      - name: Deploy
-        if: github.event_name == 'push'
-        run: npx wrangler deploy
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          # Required: wrangler picks the account on its own only when the token can see exactly
-          # one, and CI has no TTY to prompt. Without it a multi-account token fails the deploy
-          # after the tests have already gone green.
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

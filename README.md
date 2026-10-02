@@ -30,7 +30,7 @@ You need a Cloudflare account, a Mailgun account with a verified sending domain 
 
 ### Deploying changes
 
-`.github/workflows/ci.yml` typechecks and tests every pull request, and deploys on every push to `main`. It needs two repository secrets: `CLOUDFLARE_API_TOKEN`, holding a token with the **Edit Cloudflare Workers** template permissions, and `CLOUDFLARE_ACCOUNT_ID`. The account ID is required because wrangler resolves the account by itself only when the token can see exactly one, and CI has no terminal to prompt at; `npx wrangler whoami` prints it. Migrations are not run by CI — apply them with `npm run db:migrate` when one lands.
+`.github/workflows/ci.yml` typechecks and tests every push, on every branch. `.github/workflows/deploy.yml` runs only on a push to `main`, and repeats the checks before deploying — two workflows on one push start in parallel, so that repetition is what gates the deploy on the tests of the commit it is about to ship. Deploying needs two repository secrets: `CLOUDFLARE_API_TOKEN`, holding a token with the **Edit Cloudflare Workers** template permissions, and `CLOUDFLARE_ACCOUNT_ID`. The account ID is required because wrangler resolves the account by itself only when the token can see exactly one, and CI has no terminal to prompt at; `npx wrangler whoami` prints it. Migrations are not run by CI — apply them with `npm run db:migrate` when one lands.
 
 ### Subscribe form
 
