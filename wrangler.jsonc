@@ -1,5 +1,6 @@
 // Configured for the Narthur Online newsletter. Forking? Edit the `vars` and `routes` below.
-// A gitignored `wrangler.<name>.jsonc` passed as `-c` still overrides this for local testing.
+// `wrangler dev` and `deploy` still take a gitignored `wrangler.<name>.jsonc` via `-c`. The test
+// suite does not: vitest.config.ts reads this file directly and pins the vars it asserts on.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "rss-to-email",
