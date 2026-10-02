@@ -706,7 +706,7 @@ describe("fitImages", () => {
 
 describe("batchSize", () => {
   it("defaults to one and clamps anything out of range", () => {
-    expect(batchSize({ ...env, BATCH_SIZE: undefined })).toBe(DEFAULT_BATCH_SIZE); // unset, not 1-from-wrangler.jsonc
+    expect(batchSize({ ...env, BATCH_SIZE: undefined })).toBe(DEFAULT_BATCH_SIZE); // unset, not 1-from-vitest.config.ts
     expect(batchSize(env)).toBe(DEFAULT_BATCH_SIZE);
     expect(batchSize({ ...env, BATCH_SIZE: 1000 })).toBe(1000);
     expect(batchSize({ ...env, BATCH_SIZE: "250" })).toBe(250);
