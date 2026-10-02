@@ -47,7 +47,7 @@ A range of subscriber IDs a tick has taken for an issue, recorded as an in-fligh
 _Avoid_: Chunk, slice, lease
 
 **Batch**:
-One provider call delivering an issue to a claimed range of subscribers. `BATCH_SIZE` sets how many, and defaults to 1 — so a batch is normally one recipient, and the range holds one ID.
+One provider call delivering an issue to a claimed range of subscribers. `BATCH_SIZE` sets how many, and falls back to 1 when unset — at which point a batch is one recipient and the range holds one ID. This deployment's config sets 5.
 
 **Suppressed**:
 An address the provider will not deliver to, because it bounced or the recipient reported spam. Mirrored into `subscribers` as `status = 'unsubscribed'` with an `unsubscribe_reason` of `bounce` or `complaint`.
