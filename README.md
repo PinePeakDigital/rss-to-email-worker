@@ -23,10 +23,14 @@ The domain vocabulary is defined in [CONTEXT.md](CONTEXT.md).
 You need a Cloudflare account, a Mailgun account with a verified sending domain (SPF, DKIM and DMARC set up), and a Turnstile widget.
 
 1. `npm install`.
-2. Replace the placeholder `vars` and `routes` in `wrangler.jsonc`. Or, to keep your values out of a fork you publish, copy the file to `wrangler.<name>.jsonc` (gitignored) and add `-c wrangler.<name>.jsonc` to the wrangler commands below (`npm run deploy -- -c …`). Set: the feed URL, the Worker's public URL, the site name and URL, the From address, the admin email, and the Mailgun domain. Use `https://api.eu.mailgun.net` for EU-region Mailgun.
+2. Replace the `vars` and `routes` in `wrangler.jsonc` with your own — the committed values are the ones this repo deploys for Narthur Online. Set: the feed URL, the Worker's public URL, the site name and URL, the From address, the admin email, and the Mailgun domain. Use `https://api.eu.mailgun.net` for EU-region Mailgun. Start `BATCH_SIZE` at 1 on a new sending domain. (`wrangler.*.jsonc` is gitignored if you want an uncommitted override to pass as `-c`.)
 3. Set the secrets: `npx wrangler secret put MAILGUN_API_KEY` and `npx wrangler secret put TURNSTILE_SECRET`.
 4. `npm run deploy`, then `npm run db:migrate`. The first deploy creates the D1 database. Wrangler may offer to write its ID into `wrangler.jsonc`; discard that change, since later deploys don't need it. The Worker's first cron tick fails until the migration has run, and the next tick picks up from there.
 5. **Wait for the first cron tick,** or trigger it from the dashboard, before publishing anything new. It records the current feed as already sent.
+
+### Deploying changes
+
+`.github/workflows/ci.yml` typechecks and tests every pull request, and deploys on every push to `main`. It needs one repository secret, `CLOUDFLARE_API_TOKEN`, holding a token with the **Edit Cloudflare Workers** template permissions. Migrations are not run by CI — apply them with `npm run db:migrate` when one lands.
 
 ### Subscribe form
 

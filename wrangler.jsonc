@@ -1,5 +1,5 @@
-// Placeholder values: edit them here, or copy this file to a gitignored wrangler.<name>.jsonc
-// and pass `-c wrangler.<name>.jsonc` to wrangler commands.
+// Configured for the Narthur Online newsletter. Forking? Edit the `vars` and `routes` below.
+// A gitignored `wrangler.<name>.jsonc` passed as `-c` still overrides this for local testing.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "rss-to-email",
@@ -8,7 +8,7 @@
   "triggers": { "crons": ["0 * * * *"] },
   // console.error from tick/send is the only record of Mailgun failures: keep logs on.
   "observability": { "enabled": true, "logs": { "enabled": true } },
-  "routes": [{ "pattern": "mail.example.com", "custom_domain": true }],
+  "routes": [{ "pattern": "mail.nathanarthur.com", "custom_domain": true }],
   "d1_databases": [
     {
       "binding": "DB",
@@ -19,18 +19,18 @@
   ],
   // Secrets (`npx wrangler secret put`): MAILGUN_API_KEY, TURNSTILE_SECRET.
   "vars": {
-    "FEED_URL": "https://example.com/rss.xml",
-    "PUBLIC_URL": "https://mail.example.com",
-    "SITE_NAME": "Example Newsletter",
-    "SITE_URL": "https://example.com",
-    "FROM": "Example Newsletter <newsletter@mail.example.com>",
-    "ADMIN_EMAIL": "you@example.com",
-    "MAILGUN_DOMAIN": "mail.example.com",
+    "FEED_URL": "https://nathanarthur.com/rss.xml",
+    "PUBLIC_URL": "https://mail.nathanarthur.com",
+    "SITE_NAME": "Narthur Online",
+    "SITE_URL": "https://nathanarthur.com",
+    "FROM": "Nathan Arthur <newsletter@mail.nathanarthur.com>",
+    "ADMIN_EMAIL": "nathan@pinepeakdigital.com",
+    "MAILGUN_DOMAIN": "mail.nathanarthur.com",
     // EU-region Mailgun accounts: https://api.eu.mailgun.net
     "MAILGUN_API_BASE": "https://api.mailgun.net",
     // Recipients per Mailgun call. Mailgun 403s large batches from a new sending domain and gives
-    // no way to ask when that lifts, so 1 is the size that always works; raise it (max 1000) by
-    // testing upward. At 1, a tick delivers 150 messages, so a few hundred subscribers take hours.
-    "BATCH_SIZE": 1
+    // no way to ask when that lifts, so a new domain should start at 1; it 403'd a batch of 26 on
+    // 2026-09-20, so this domain's cap is somewhere below that. Raise it (max 1000) by testing up.
+    "BATCH_SIZE": 5
   }
 }
