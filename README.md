@@ -3,7 +3,7 @@
 Emails new items from an RSS feed to double-opt-in subscribers. It runs on Cloudflare Workers and D1, and sends through Mailgun. Built for the [Narthur Online](https://nathanarthur.com) newsletter, and configurable for any feed.
 
 - **Subscribe:** an HTML form on your site, protected by Turnstile, with double opt-in. The consent time and source are recorded.
-- **Send:** an hourly cron fetches the feed and emails each new item, as a full post in a light template, to every active subscriber. It sends one message per recipient by default, because Mailgun refuses large batches from a new sending domain (`403 … is not allowed to send large batches yet`) quietly enough to be easy to miss. Set `BATCH_SIZE` up to 1,000 to batch once yours is allowed — which, since Mailgun documents none of this and exposes no way to query it, you can only learn by trying. See [ADR 0002](docs/adr/0002-send-individually-by-default.md).
+- **Send:** an hourly cron fetches the feed and emails each new item, as a full post in a light template, to every active subscriber. It sends one message per recipient unless `BATCH_SIZE` says otherwise, because Mailgun refuses large batches from a new sending domain (`403 … is not allowed to send large batches yet`) quietly enough to be easy to miss. Set `BATCH_SIZE` up to 1,000 to batch once yours is allowed — which, since Mailgun documents none of this and exposes no way to query it, you can only learn by trying. See [ADR 0002](docs/adr/0002-send-individually-by-default.md).
 - **Unsubscribe:** a tokenized link in every email, plus RFC 8058 one-click `List-Unsubscribe` headers, which Gmail and Yahoo require from bulk senders.
 
 ## How sending stays correct
