@@ -6,6 +6,8 @@
   "name": "rss-to-email",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-15",
+  // @sentry/cloudflare needs AsyncLocalStorage.
+  "compatibility_flags": ["nodejs_compat"],
   "triggers": { "crons": ["0 * * * *"] },
   // console.error from tick/send is the only record of Mailgun failures: keep logs on.
   "observability": { "enabled": true, "logs": { "enabled": true } },
@@ -32,6 +34,8 @@
     // Recipients per Mailgun call. Mailgun 403s large batches from a new sending domain and gives
     // no way to ask when that lifts, so a new domain should start at 1; it 403'd a batch of 26 on
     // 2026-09-20, so this domain's cap is somewhere below that. Raise it (max 1000) by testing up.
-    "BATCH_SIZE": 5
+    "BATCH_SIZE": 5,
+    // Not a secret: a DSN only permits submitting events. Empty disables Sentry.
+    "SENTRY_DSN": ""
   }
 }
