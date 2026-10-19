@@ -36,6 +36,6 @@
     // 2026-09-20, so this domain's cap is somewhere below that. Raise it (max 1000) by testing up.
     "BATCH_SIZE": 5,
     // Not a secret: a DSN only permits submitting events. Empty disables Sentry.
-    "SENTRY_DSN": ""
+    "SENTRY_DSN": "https://be63e3c3bd549d7418aed5b7ac07b8f7@o4511632382558208.ingest.us.sentry.io/4512285325197312"
   }
 }
