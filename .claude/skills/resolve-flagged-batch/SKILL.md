@@ -15,4 +15,4 @@ A **flagged batch** was handed to Mailgun, but its outcome was never recorded. I
 3. **Show the evidence to the user and get their go-ahead,** then record the outcome.
    - Accepted: `npx wrangler d1 execute DB --remote --command "UPDATE batches SET status = 'sent' WHERE id = <id> AND status = 'flagged'"`
    - Not accepted: the same command with `status = 'failed'`. The next hourly tick resends the batch to the active subscribers in its range.
-   - A partial acceptance can't be split. Report it to the user and let them choose.
+   - A partial acceptance can't be split. Report it to the user and let them choose. This only arises when `BATCH_SIZE` is above 1; at the default a flagged batch is one recipient, which Mailgun either took or didn't.

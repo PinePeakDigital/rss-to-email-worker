@@ -1,0 +1,43 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# One deploy at a time, and never cancel one mid-flight: wrangler is partway through replacing
+# the live Worker.
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Test and deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # Re-run the checks here rather than waiting on the CI workflow. Two workflows on the same
+      # push start in parallel, so without this the deploy would not be gated on the tests at all.
+      # ponytail: 20s of duplicate work beats a workflow_run handshake, and it gates on the tests
+      # of the exact commit being deployed.
+      - run: npm run typecheck
+      - run: npm test
+      # Migrations stay manual (`npm run db:migrate`): they are rare, and ordering one against a
+      # deploy is fiddly enough that a late migration beats a wrong one.
+      - run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          # Required: wrangler picks the account on its own only when the token can see exactly
+          # one, and CI has no TTY to prompt. Without it a multi-account token fails the deploy
+          # after the tests have already gone green.
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

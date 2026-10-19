@@ -1,0 +1,34 @@
+name: CI
+
+# Every branch. A same-repo pull request shows this run as its check, since a check attaches to
+# the commit sha whatever triggered it. A pull request from a fork pushes nothing here, so it gets
+# no CI at all — there are no forks, and deploying moved to its own workflow, so add
+# `pull_request:` if that ever changes.
+on: push
+
+# Read-only is all this needs: nothing here comments on a PR or writes to the repo.
+permissions:
+  contents: read
+
+# A newer push to the same branch supersedes this run. The deploy has its own group and is
+# never cancelled.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Typecheck and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Nothing here pushes, so don't leave the token in .git/config for later steps.
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
