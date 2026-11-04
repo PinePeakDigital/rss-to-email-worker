@@ -810,6 +810,31 @@ describe("subscription pages", () => {
     expect(await status("a@b.co")).toEqual({});
   });
 
+  it("logs a wrong Turnstile secret through console.error, without the secret, token or email", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.mocked(fetch).mockResolvedValueOnce(Response.json({ success: false, "error-codes": ["invalid-input-secret"] }));
+    expect((await post("/subscribe", { email: "a@b.co", "cf-turnstile-response": "tok-123" })).status).toBe(400);
+    const logged = err.mock.calls.flat().join(" ");
+    expect(logged).toContain("invalid-input-secret");
+    vi.mocked(fetch).mockResolvedValueOnce(Response.json({ success: false, "error-codes": ["missing-input-secret"] }));
+    expect((await post("/subscribe", { email: "a@b.co", "cf-turnstile-response": "tok-123" })).status).toBe(400);
+    expect(err.mock.calls.flat().join(" ")).toContain("missing-input-secret");
+    for (const secret of [env.TURNSTILE_SECRET, "tok-123", "a@b.co"]) expect(logged).not.toContain(secret);
+  });
+
+  it("logs an ordinary Turnstile rejection and a mismatched site below error level", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.mocked(fetch).mockResolvedValueOnce(Response.json({ success: false, "error-codes": ["invalid-input-response"] }));
+    await post("/subscribe", { email: "a@b.co", "cf-turnstile-response": "bad" });
+    vi.mocked(fetch).mockResolvedValueOnce(Response.json({ success: true, action: "subscribe", hostname: "evil.test" }));
+    await post("/subscribe", { email: "a@b.co", "cf-turnstile-response": "other-site" });
+    expect(err).not.toHaveBeenCalled();
+    const logged = warn.mock.calls.flat().map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" ");
+    expect(logged).toContain("invalid-input-response");
+    expect(logged).toContain("evil.test");
+  });
+
   it("accepts a token from the www host", async () => {
     vi.mocked(fetch).mockResolvedValueOnce(Response.json({ success: true, action: "subscribe", hostname: "www.example.com" }));
     expect((await post("/subscribe", { email: "w@b.co", "cf-turnstile-response": "ok" })).status).toBe(200);
