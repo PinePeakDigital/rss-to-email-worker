@@ -120,7 +120,7 @@ async function turnstileOk(env: Env, response: string, ip: string | null): Promi
   const result = res?.ok
     ? ((await res.json().catch(() => null)) as {
         success: boolean;
-        "error-codes"?: string[];
+        "error-codes"?: unknown;
         action?: string;
         hostname?: string;
       } | null)
@@ -128,7 +128,7 @@ async function turnstileOk(env: Env, response: string, ip: string | null): Promi
   if (!result) return false;
   if (!result.success) {
     // A wrong secret rejects every signup, so it must reach Sentry; bot and expired-token codes must not.
-    const codes = result["error-codes"] ?? [];
+    const codes = Array.isArray(result["error-codes"]) ? result["error-codes"].map(String) : [];
     const misconfigured = codes.some((c) => c === "invalid-input-secret" || c === "missing-input-secret");
     (misconfigured ? console.error : console.warn)("Turnstile siteverify rejected the token", codes.join(",") || "no error-codes");
     return false;

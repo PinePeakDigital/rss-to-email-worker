@@ -816,6 +816,9 @@ describe("subscription pages", () => {
     expect((await post("/subscribe", { email: "a@b.co", "cf-turnstile-response": "tok-123" })).status).toBe(400);
     const logged = err.mock.calls.flat().join(" ");
     expect(logged).toContain("invalid-input-secret");
+    vi.mocked(fetch).mockResolvedValueOnce(Response.json({ success: false, "error-codes": ["missing-input-secret"] }));
+    expect((await post("/subscribe", { email: "a@b.co", "cf-turnstile-response": "tok-123" })).status).toBe(400);
+    expect(err.mock.calls.flat().join(" ")).toContain("missing-input-secret");
     for (const secret of [env.TURNSTILE_SECRET, "tok-123", "a@b.co"]) expect(logged).not.toContain(secret);
   });
 
