@@ -118,12 +118,28 @@ async function turnstileOk(env: Env, response: string, ip: string | null): Promi
     (e) => (console.error("Turnstile siteverify unreachable", e), null),
   );
   const result = res?.ok
-    ? ((await res.json().catch(() => null)) as { success: boolean; action?: string; hostname?: string } | null)
+    ? ((await res.json().catch(() => null)) as {
+        success: boolean;
+        "error-codes"?: string[];
+        action?: string;
+        hostname?: string;
+      } | null)
     : null;
   if (!result) return false;
+  if (!result.success) {
+    // A wrong secret rejects every signup, so it must reach Sentry; bot and expired-token codes must not.
+    const codes = result["error-codes"] ?? [];
+    const misconfigured = codes.some((c) => c === "invalid-input-secret" || c === "missing-input-secret");
+    (misconfigured ? console.error : console.warn)("Turnstile siteverify rejected the token", codes.join(",") || "no error-codes");
+    return false;
+  }
   // A token is only good for the subscribe form on our own site, not one minted elsewhere with this sitekey.
   const site = new URL(env.SITE_URL).hostname.replace(/^www\./, "");
-  return result.success && result.action === "subscribe" && [site, `www.${site}`].includes(result.hostname ?? "");
+  if (result.action !== "subscribe" || ![site, `www.${site}`].includes(result.hostname ?? "")) {
+    console.warn("Turnstile token for another form or site", { action: result.action, hostname: result.hostname });
+    return false;
+  }
+  return true;
 }
 
 function button(action: string, label: string): string {
